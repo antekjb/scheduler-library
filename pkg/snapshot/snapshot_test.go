@@ -17,9 +17,11 @@ package snapshot
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"fmt"
+	"sort"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -32,6 +34,8 @@ import (
 	plugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
+	"k8s.io/kubernetes/pkg/scheduler"
+	upstreamsync "sigs.k8s.io/scheduler-library/pkg/upstream_sync"
 )
 
 func init() {
@@ -69,9 +73,9 @@ func TestPreemptionSnapshot(t *testing.T) {
 			name: "Unpreempt fails when mutation added to current tx",
 			setupSnapshot: func(cs *ClusterSnapshot) {
 				if cs.txCompensation == nil {
-					cs.txCompensation = make(map[string][]func() error)
+					cs.txCompensation = make(map[string][]func())
 				}
-				cs.txCompensation[""] = []func() error{func() error { return nil }}
+				cs.txCompensation[""] = []func(){func() {}}
 			},
 			expectErr: true,
 		},
@@ -99,22 +103,12 @@ func TestPreemptionSnapshot(t *testing.T) {
 				},
 				schedulerSnapshot: snapshot,
 			}
-			pods := []*v1.Pod{{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "pod1",
-					Namespace: "default",
-					UID:       "uid1",
-				},
-				Spec: v1.PodSpec{
-					NodeName: "node1",
-				},
-			}} // dummy pod
 
-			ps := newPreemptionSnapshot(cs, pods, []string{"node1"})
+			ps := newPreemptionSnapshot(cs, []func(){func() {}})
 
 			tc.setupSnapshot(cs)
 
-			err = ps.Unpreempt(ctx, klog.FromContext(ctx))
+			err = ps.Unpreempt()
 			if (err != nil) != tc.expectErr {
 				t.Errorf("Unpreempt() error = %v, expectErr %v", err, tc.expectErr)
 			}
@@ -144,7 +138,7 @@ func TestUnpreemptRestoresPods(t *testing.T) {
 	cs := &ClusterSnapshot{
 		frameworks:        map[string]framework.Framework{v1.DefaultSchedulerName: f},
 		schedulerSnapshot: snap,
-		txCompensation:    make(map[string][]func() error),
+		txCompensation:    make(map[string][]func()),
 	}
 
 	// Verify pod is on node before preemption.
@@ -157,7 +151,7 @@ func TestUnpreemptRestoresPods(t *testing.T) {
 	}
 
 	// Preempt the pod.
-	ps, err := cs.PreemptPods(ctx, klog.FromContext(ctx), []*v1.Pod{pod})
+	ps, err := cs.PreemptPods(ctx, nil, []*v1.Pod{pod})
 	if err != nil {
 		t.Fatalf("PreemptPods() error = %v", err)
 	}
@@ -172,7 +166,7 @@ func TestUnpreemptRestoresPods(t *testing.T) {
 	}
 
 	// Restore via Unpreempt.
-	if err := ps.Unpreempt(ctx, klog.FromContext(ctx)); err != nil {
+	if err := ps.Unpreempt(); err != nil {
 		t.Fatalf("Unpreempt() error = %v", err)
 	}
 
@@ -199,9 +193,8 @@ func TestTransaction(t *testing.T) {
 			name: "Commit succeeds and doesn't revert",
 			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
 				var activeTx = cs.transactions[len(cs.transactions)-1]
-				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() error {
+				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() {
 					*revertCalled = true
-					return nil
 				})
 				return Commit, nil
 			},
@@ -213,9 +206,8 @@ func TestTransaction(t *testing.T) {
 			name: "Revert requested and executed",
 			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
 				var activeTx = cs.transactions[len(cs.transactions)-1]
-				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() error {
+				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() {
 					*revertCalled = true
-					return nil
 				})
 				return Revert, nil
 			},
@@ -227,9 +219,8 @@ func TestTransaction(t *testing.T) {
 			name: "Revert on error",
 			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
 				activeTx := cs.transactions[len(cs.transactions)-1]
-				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() error {
+				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() {
 					*revertCalled = true
-					return nil
 				})
 				return Commit, fmt.Errorf("some error")
 			},
@@ -237,54 +228,12 @@ func TestTransaction(t *testing.T) {
 			expectStackEmpty: true,
 			expectErr:        true,
 		},
-		{
-			name: "Revert fails",
-			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
-				activeTx := cs.transactions[len(cs.transactions)-1]
-				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() error {
-					*revertCalled = true
-					return fmt.Errorf("revert failed")
-				})
-				return Revert, nil
-			},
-			expectRevert:     true,
-			expectStackEmpty: true,
-			expectErr:        true,
-		},
-		{
-			name: "Revert fails immediately",
-			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
-				activeTx := cs.transactions[len(cs.transactions)-1]
-
-				// This operation should NOT be called because the one added after it will fail first.
-				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() error {
-					state["op1Called"] = true
-					return nil
-				})
-
-				// This operation fails and should be executed first (last added).
-				cs.txCompensation[activeTx] = append(cs.txCompensation[activeTx], func() error {
-					*revertCalled = true
-					return fmt.Errorf("revert failed")
-				})
-
-				return Revert, nil
-			},
-			expectRevert:     true,
-			expectStackEmpty: true,
-			expectErr:        true,
-			checkResult: func(t *testing.T, revertCalled bool, state map[string]any) {
-				if state["op1Called"] == true {
-					t.Errorf("Expected op1 to NOT be called, but it was")
-				}
-			},
-		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := &ClusterSnapshot{
-				txCompensation: make(map[string][]func() error),
+				txCompensation: make(map[string][]func()),
 			}
 			revertCalled := false
 			state := make(map[string]any)
@@ -376,12 +325,21 @@ func TestCanSchedulePod(t *testing.T) {
 				CandidateNodeNames: tc.candidateNodes,
 			}
 
-			nodes, err := cs.CanSchedulePod(ctx, klog.FromContext(ctx), pod)
+			realSched := &scheduler.Scheduler{
+				Profiles: map[string]framework.Framework{
+					v1.DefaultSchedulerName: f,
+				},
+			}
+			sched := upstreamsync.NewScheduler(realSched, snapshot)
+
+			nodes, err := cs.CanSchedulePod(ctx, sched, klog.FromContext(ctx), pod)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("CanSchedulePod() error = %v, expectErr %v", err, tc.expectErr)
 			}
 
 			if !tc.expectErr {
+				sort.Strings(nodes)
+				sort.Strings(tc.expectNodes)
 				if len(nodes) != len(tc.expectNodes) {
 					t.Errorf("Expected nodes %v, got %v", tc.expectNodes, nodes)
 				} else {
@@ -507,27 +465,6 @@ func TestSchedulePods(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			registry := plugins.NewInTreeRegistry()
-			profile := schedulerapi.KubeSchedulerProfile{
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{
-						Enabled: []schedulerapi.Plugin{
-							{Name: "PrioritySort"},
-						},
-					},
-					Filter: schedulerapi.PluginSet{
-						Enabled: []schedulerapi.Plugin{
-							{Name: "NodeUnschedulable"},
-						},
-					},
-					Bind: schedulerapi.PluginSet{
-						Enabled: []schedulerapi.Plugin{
-							{Name: "DefaultBinder"},
-						},
-					},
-				},
-			}
-			informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(), 0)
 
 			var nodes []*v1.Node
 			nodeMap := make(map[string]*v1.Node)
@@ -540,6 +477,14 @@ func TestSchedulePods(t *testing.T) {
 					if nodeName != "non-existent-node" && nodeMap[nodeName] == nil {
 						node := &v1.Node{
 							ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+							Status: v1.NodeStatus{
+								Allocatable: v1.ResourceList{
+									v1.ResourcePods: resource.MustParse("110"),
+								},
+								Capacity: v1.ResourceList{
+									v1.ResourcePods: resource.MustParse("110"),
+								},
+							},
 						}
 						if _, ok := unschedSet[nodeName]; ok {
 							node.Spec.Unschedulable = true
@@ -550,30 +495,14 @@ func TestSchedulePods(t *testing.T) {
 				}
 			}
 
-			snapshot := cache.NewSnapshot(nil, nodes)
-
-			f, err := frameworkruntime.NewFramework(ctx, registry, &profile,
-				frameworkruntime.WithSnapshotSharedLister(snapshot),
-				frameworkruntime.WithInformerFactory(informerFactory),
-			)
-			if err != nil {
-				t.Fatalf("failed to create framework: %v", err)
-			}
-
-			cs := &ClusterSnapshot{
-				frameworks: map[string]framework.Framework{
-					v1.DefaultSchedulerName: f,
-				},
-				schedulerSnapshot: snapshot,
-				txCompensation:    make(map[string][]func() error),
-			}
+			cs, _, sched := setupSnapshotTest(t, ctx, nodes, nil)
 
 			if tc.inTransaction {
 				cs.transactions = append(cs.transactions, "tx1")
-				cs.txCompensation["tx1"] = []func() error{}
+				cs.txCompensation["tx1"] = []func(){}
 			}
 
-			results, err := cs.SchedulePods(ctx, klog.FromContext(ctx), tc.pods, tc.opts)
+			results, err := cs.SchedulePods(ctx, sched, klog.FromContext(ctx), tc.pods, tc.opts)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("SchedulePods() error = %v, expectErr %v", err, tc.expectErr)
 			}
@@ -650,39 +579,30 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			registry := plugins.NewInTreeRegistry()
-			profile := schedulerapi.KubeSchedulerProfile{}
-			informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(), 0)
 
 			var nodes []*v1.Node
 			for _, nodeName := range tc.candidateNodes {
-				nodes = append(nodes, &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}})
+				nodes = append(nodes, &v1.Node{
+					ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+					Status: v1.NodeStatus{
+						Allocatable: v1.ResourceList{
+							v1.ResourcePods: resource.MustParse("110"),
+						},
+						Capacity: v1.ResourceList{
+							v1.ResourcePods: resource.MustParse("110"),
+						},
+					},
+				})
 			}
 
-			snapshot := cache.NewSnapshot(nil, nodes)
-
-			f, err := frameworkruntime.NewFramework(ctx, registry, &profile,
-				frameworkruntime.WithSnapshotSharedLister(snapshot),
-				frameworkruntime.WithInformerFactory(informerFactory),
-			)
-			if err != nil {
-				t.Fatalf("failed to create framework: %v", err)
-			}
-
-			cs := &ClusterSnapshot{
-				frameworks: map[string]framework.Framework{
-					v1.DefaultSchedulerName: f,
-				},
-				schedulerSnapshot: snapshot,
-				txCompensation:    make(map[string][]func() error),
-			}
+			cs, _, sched := setupSnapshotTest(t, ctx, nodes, nil)
 
 			if tc.inTransaction {
 				cs.transactions = append(cs.transactions, "tx1")
-				cs.txCompensation["tx1"] = []func() error{}
+				cs.txCompensation["tx1"] = []func(){}
 			}
 
-			results, err := cs.SchedulePodsByTemplate(ctx, klog.FromContext(ctx), tc.template, tc.candidateNodes, tc.maxPods, tc.opts)
+			results, err := cs.SchedulePodsByTemplate(ctx, sched, klog.FromContext(ctx), tc.template, tc.candidateNodes, tc.maxPods, tc.opts)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("SchedulePodsByTemplate() error = %v, expectErr %v", err, tc.expectErr)
 			}

@@ -18,19 +18,24 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework"
-	plugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
-	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"k8s.io/kubernetes/pkg/scheduler/profile"
+	upstreamsync "sigs.k8s.io/scheduler-library/pkg/upstream_sync"
 )
 
 func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
@@ -40,7 +45,7 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 	// 1. Test Setup and Initialization
 	nodes := generateMockNodes(100)
 	pods := generateMockPods(nodes)
-	cs, snap := setupSnapshotTest(t, ctx, nodes, pods)
+	cs, snap, sched := setupSnapshotTest(t, ctx, nodes, pods)
 
 	// We use pods[1] (which is on node1) as the pod to preempt,
 	// to match the original test logic.
@@ -51,7 +56,6 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 		Pod: &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "vpod1", Namespace: "default", UID: "vuid1"},
 			Spec: v1.PodSpec{
-				NodeName: "node1",
 				Containers: []v1.Container{{
 					Resources: v1.ResourceRequirements{
 						Requests: v1.ResourceList{
@@ -64,7 +68,7 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 		CandidateNodeNames: []string{"node1"},
 	}
 
-	_, err := cs.SchedulePods(ctx, logger, []SchedulablePod{vpod1}, SchedulePodsOptions{})
+	_, err := cs.SchedulePods(ctx, sched, logger, []SchedulablePod{vpod1}, SchedulePodsOptions{})
 	if err != nil {
 		t.Fatalf("failed to schedule virtual pod: %v", err)
 	}
@@ -117,11 +121,11 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 			// Use a fresh snapshot for each simulation attempt to avoid transaction issues
 			// Append vpod1.Pod to pods for simulation so it is in NodeInfo.
 			simPods := append([]*v1.Pod{vpod1.Pod}, pods...)
-			csSim, _ := setupSnapshotTest(t, ctx, nodes, simPods)
+			csSim, _, schedSim := setupSnapshotTest(t, ctx, nodes, simPods)
 
 			for _, batch := range pSet {
 				logger.Info("Step 4: Preempting batch", "batch", batch)
-				_, err := csSim.PreemptPods(ctx, logger, batch)
+				_, err := csSim.PreemptPods(ctx, schedSim, batch)
 				if err != nil {
 					t.Fatalf("PreemptPods failed in simulation: %v", err)
 				}
@@ -129,7 +133,7 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 			}
 
 			logger.Info("Step 4: Before simulateWorkload")
-			fits, err := simulateWorkload(ctx, logger, csSim, wtd.workload)
+			fits, err := simulateWorkload(ctx, logger, csSim, schedSim, wtd.workload)
 			if err != nil {
 				t.Fatalf("simulateWorkload failed: %v", err)
 			}
@@ -142,8 +146,8 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 				for i := len(pSet) - 1; i >= 0; i-- {
 					batch := pSet[i]
 					// Try simulation WITHOUT this batch
-					csSimFB, _ := setupSnapshotTest(t, ctx, nodes, pods)
-					_, err := csSimFB.SchedulePods(ctx, logger, []SchedulablePod{vpod1}, SchedulePodsOptions{})
+					csSimFB, _, schedFB := setupSnapshotTest(t, ctx, nodes, pods)
+					_, err := csSimFB.SchedulePods(ctx, schedFB, logger, []SchedulablePod{vpod1}, SchedulePodsOptions{})
 					if err != nil {
 						t.Fatalf("failed to schedule virtual pod in fill-back: %v", err)
 					}
@@ -153,13 +157,13 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 						if j == i {
 							continue
 						}
-						_, err := csSimFB.PreemptPods(ctx, logger, b)
+						_, err := csSimFB.PreemptPods(ctx, schedFB, b)
 						if err != nil {
 							t.Fatalf("PreemptPods failed in fill-back: %v", err)
 						}
 					}
 
-					fitsFB, err := simulateWorkload(ctx, logger, csSimFB, wtd.workload)
+					fitsFB, err := simulateWorkload(ctx, logger, csSimFB, schedFB, wtd.workload)
 					if err != nil {
 						t.Fatalf("simulateWorkload failed in fill-back: %v", err)
 					}
@@ -184,13 +188,13 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 		if bestSet != nil {
 			logger.Info("Step 5: Applying best set", "batches", len(bestSet))
 			for _, batch := range bestSet {
-				_, err := cs.PreemptPods(ctx, logger, batch)
+				_, err := cs.PreemptPods(ctx, sched, batch)
 				if err != nil {
 					t.Fatalf("failed to apply preemption: %v", err)
 				}
 
 			}
-			results, err := cs.SchedulePodsByTemplate(ctx, logger, wtd.workload.PodTemplate, []string{"node1"}, wtd.workload.TargetCount, SchedulePodsByTemplateOptions{})
+			results, err := cs.SchedulePodsByTemplate(ctx, sched, logger, wtd.workload.PodTemplate, []string{"node1"}, wtd.workload.TargetCount, SchedulePodsByTemplateOptions{})
 			logger.Info("Step 5: SchedulePodsByTemplate results", "results", len(results), "err", err)
 			if err != nil {
 				t.Fatalf("failed to schedule workload: %v", err)
@@ -229,9 +233,22 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 	}
 }
 
-func setupSnapshotTest(t *testing.T, ctx context.Context, nodes []*v1.Node, pods []*v1.Pod) (*ClusterSnapshot, *cache.Snapshot) {
-	registry := plugins.NewInTreeRegistry()
-	profile := schedulerapi.KubeSchedulerProfile{
+func setupSnapshotTest(t *testing.T, ctx context.Context, nodes []*v1.Node, pods []*v1.Pod) (*ClusterSnapshot, *cache.Snapshot, *upstreamsync.Scheduler) {
+	logger := klog.FromContext(ctx)
+	client := fake.NewClientset()
+	for _, n := range nodes {
+		if _, err := client.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("failed to create node in fake client: %v", err)
+		}
+	}
+	for _, p := range pods {
+		if _, err := client.CoreV1().Pods(p.Namespace).Create(ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("failed to create pod in fake client: %v", err)
+		}
+	}
+
+	prof := schedulerapi.KubeSchedulerProfile{
+		SchedulerName: v1.DefaultSchedulerName,
 		Plugins: &schedulerapi.Plugins{
 			QueueSort: schedulerapi.PluginSet{
 				Enabled: []schedulerapi.Plugin{
@@ -246,6 +263,7 @@ func setupSnapshotTest(t *testing.T, ctx context.Context, nodes []*v1.Node, pods
 			Filter: schedulerapi.PluginSet{
 				Enabled: []schedulerapi.Plugin{
 					{Name: "NodeResourcesFit"},
+					{Name: "NodeUnschedulable"},
 				},
 			},
 			Bind: schedulerapi.PluginSet{
@@ -266,53 +284,52 @@ func setupSnapshotTest(t *testing.T, ctx context.Context, nodes []*v1.Node, pods
 		},
 	}
 
-	logger := klog.FromContext(ctx)
-	client := fake.NewClientset()
-
-	for _, n := range nodes {
-		if _, err := client.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{}); err != nil {
-			t.Fatalf("failed to create node in fake client: %v", err)
-		}
-	}
-	for _, p := range pods {
-		if _, err := client.CoreV1().Pods(p.Namespace).Create(ctx, p, metav1.CreateOptions{}); err != nil {
-			t.Fatalf("failed to create pod in fake client: %v", err)
-		}
-	}
-
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
-
-	c := cache.New(ctx, nil, false)
-	for _, n := range nodes {
-		c.AddNode(logger, n)
+	broadcaster := events.NewBroadcaster(nil)
+	recorderFactory := profile.NewRecorderFactory(broadcaster)
+	sched, err := scheduler.New(ctx,
+		client,
+		informerFactory,
+		nil,
+		recorderFactory,
+		scheduler.WithProfiles(prof),
+	)
+	if err != nil {
+		t.Fatalf("failed to create scheduler: %v", err)
 	}
-	for _, p := range pods {
-		if err := c.AddPod(logger, p); err != nil {
-			t.Fatalf("failed to add pod to cache: %v", err)
+
+	informerFactory.Start(ctx.Done())
+	if !toolscache.WaitForCacheSync(ctx.Done(), informerFactory.Core().V1().Nodes().Informer().HasSynced, informerFactory.Core().V1().Pods().Informer().HasSynced) {
+		t.Fatalf("failed to sync informers")
+	}
+
+	// Wait for scheduler cache to populate
+	err = wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		return sched.Cache.NodeCount() >= len(nodes), nil
+	})
+	if err != nil {
+		t.Fatalf("scheduler cache failed to populate nodes: %v (got %d, want %d)", err, sched.Cache.NodeCount(), len(nodes))
+	}
+
+	// Get the shared snapshot instance from the scheduler's profile.
+	var snap *cache.Snapshot
+	for _, prof := range sched.Profiles {
+		if s, ok := prof.SnapshotSharedLister().(*cache.Snapshot); ok {
+			snap = s
+			break
 		}
 	}
+	if snap == nil {
+		t.Fatalf("failed to get shared snapshot from scheduler")
+	}
 
-	snap := cache.NewEmptySnapshot()
-	if err := c.UpdateSnapshot(logger, snap); err != nil {
+	// Update the shared snapshot from the cache.
+	if err := sched.Cache.UpdateSnapshot(logger, snap); err != nil {
 		t.Fatalf("failed to update snapshot from cache: %v", err)
 	}
 
-	f, err := frameworkruntime.NewFramework(ctx, registry, &profile,
-		frameworkruntime.WithSnapshotSharedLister(snap),
-		frameworkruntime.WithInformerFactory(informerFactory),
-	)
-	if err != nil {
-		t.Fatalf("failed to create framework: %v", err)
-	}
-	informerFactory.Start(ctx.Done())
-
-	cs := &ClusterSnapshot{
-		frameworks:        map[string]framework.Framework{v1.DefaultSchedulerName: f},
-		schedulerSnapshot: snap,
-		txCompensation:    make(map[string][]func() error),
-	}
-
-	return cs, snap
+	cs := NewClusterSnapshot(snap, sched.Profiles)
+	return cs, snap, upstreamsync.NewScheduler(sched, snap)
 }
 
 type Workload struct {
@@ -323,7 +340,7 @@ type Workload struct {
 type PreemptionBatch []*v1.Pod
 type PreemptionSet []PreemptionBatch
 
-func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapshot, workload Workload) (bool, error) {
+func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapshot, sched *upstreamsync.Scheduler, workload Workload) (bool, error) {
 	logger.Info("simulateWorkload started", "pod", workload.PodTemplate.Name)
 	nodeInfo, err := cs.schedulerSnapshot.NodeInfos().Get("node1")
 	if err != nil {
@@ -331,14 +348,14 @@ func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapsh
 	} else {
 		logger.Info("node1 state in simulateWorkload", "pods", len(nodeInfo.GetPods()))
 	}
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "simulated-workload", Namespace: "default"},
+		Spec:       workload.PodTemplate.Spec,
+	}
 
-	fwk, _ := cs.getFramework("")
+	fwk, _ := sched.FrameworkForPod(pod)
 	if fwk != nil {
 		state := framework.NewCycleState()
-		pod := &v1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: "simulated-workload", Namespace: "default"},
-			Spec:       workload.PodTemplate.Spec,
-		}
 		preFilterResult, status, _ := fwk.RunPreFilterPlugins(ctx, state, pod)
 		logger.Info("simulateWorkload debug", "PreFilterStatus", status, "PreFilterResult", preFilterResult)
 
@@ -349,7 +366,7 @@ func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapsh
 		}
 	}
 
-	feasibleNodes, err := cs.CanSchedulePod(ctx, logger, SchedulablePod{
+	feasibleNodes, err := cs.CanSchedulePod(ctx, sched, logger, SchedulablePod{
 		Pod: &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "simulated-workload", Namespace: "default"},
 			Spec:       workload.PodTemplate.Spec,
@@ -364,7 +381,7 @@ func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapsh
 	logger.Info("simulateWorkload", "feasibleNodes", feasibleNodes)
 
 	if len(feasibleNodes) > 0 {
-		results, err := cs.SchedulePodsByTemplate(ctx, logger, workload.PodTemplate, feasibleNodes, workload.TargetCount, NewSchedulePodsByTemplateOptions(true))
+		results, err := cs.SchedulePodsByTemplate(ctx, sched, logger, workload.PodTemplate, feasibleNodes, workload.TargetCount, NewSchedulePodsByTemplateOptions(true))
 		if err != nil {
 			return false, err
 		}
@@ -375,8 +392,6 @@ func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapsh
 	}
 	return false, nil
 }
-
-
 
 func generateMockNodes(count int) []*v1.Node {
 	nodes := make([]*v1.Node, count)

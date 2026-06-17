@@ -25,7 +25,11 @@ type SchedulablePod struct {
 	CandidateNodeNames []string
 }
 
+// CommonSchedulingOptions contains options shared across different scheduling simulation methods.
 type CommonSchedulingOptions struct {
+	// DryRun determines if the scheduling attempt should be a dry run.
+	// When true, the simulation only tests feasibility and returns the results
+	// without updating the cluster snapshot state (any state updates are automatically restored).
 	DryRun bool
 }
 
@@ -50,11 +54,6 @@ func NewSchedulePodsByTemplateOptions(dryRun bool) SchedulePodsByTemplateOptions
 		CommonSchedulingOptions: CommonSchedulingOptions{DryRun: dryRun},
 	}
 }
-type SchedulingResult struct {
-	Pod              *v1.Pod
-	Status           *fwk.Status
-	SelectedNodeName string
-}
 
 type TransactionResult int
 
@@ -62,3 +61,16 @@ const (
 	Commit TransactionResult = iota
 	Revert
 )
+
+type SchedulingResult struct {
+	Pod              *v1.Pod
+	Status           *fwk.Status
+	SelectedNodeName string
+}
+
+type Unpreemption struct {
+	RevertFn     func()
+	pods         []*v1.Pod
+	mutation     *txMutation
+	stateVersion uint64
+}

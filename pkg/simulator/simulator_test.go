@@ -15,14 +15,21 @@
 package simulator
 
 import (
+	"context"
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/tools/events"
+	"k8s.io/klog/v2"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
+	"sigs.k8s.io/scheduler-library/pkg/snapshot"
 )
+
 
 func TestMetricsRegisteredByNewClusterState(t *testing.T) {
 	cfg := &schedulerapi.KubeSchedulerConfiguration{
@@ -36,8 +43,14 @@ func TestMetricsRegisteredByNewClusterState(t *testing.T) {
 			},
 		},
 	}
-	sim := NewSchedulingSimulator(cfg, informers.NewSharedInformerFactory(fake.NewClientset(), 0), events.NewBroadcaster(nil))
-	if _, err := sim.NewClusterState(t.Context()); err != nil {
+	ctx := t.Context()
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := NewSchedulingSimulator(ctx, cfg, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+	if _, err := sim.NewClusterState(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if metrics.CacheSize == nil {
@@ -46,12 +59,54 @@ func TestMetricsRegisteredByNewClusterState(t *testing.T) {
 }
 
 func TestNewSchedulingSimulator(t *testing.T) {
-	cfg := &schedulerapi.KubeSchedulerConfiguration{}
-	informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(), 0)
-	broadcaster := events.NewBroadcaster(nil)
-	sim := NewSchedulingSimulator(cfg, informerFactory, broadcaster)
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := NewSchedulingSimulator(t.Context(), cfg, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
 	if sim == nil {
 		t.Fatal("Expected simulator to be non-nil")
+	}
+}
+
+func TestNewSchedulingSimulatorWithNilInformerFactory(t *testing.T) {
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+	sim, err := NewSchedulingSimulator(t.Context(), cfg, nil)
+	if err != nil {
+		t.Fatalf("failed to create simulator with nil informerFactory: %v", err)
+	}
+	if sim == nil {
+		t.Fatal("Expected simulator to be non-nil")
+	}
+	if sim.informerFactory == nil {
+		t.Error("Expected informerFactory to be automatically initialized, got nil")
+	}
+
+	_, err = sim.NewClusterState(t.Context())
+	if err != nil {
+		t.Fatalf("failed to create ClusterState: %v", err)
 	}
 }
 
@@ -144,10 +199,18 @@ func TestNewClusterState(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(), 0)
-			broadcaster := events.NewBroadcaster(nil)
-			sim := NewSchedulingSimulator(tc.cfg, informerFactory, broadcaster)
+			client := fake.NewClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
 			ctx := t.Context()
+
+			sim, err := NewSchedulingSimulator(ctx, tc.cfg, informerFactory)
+			if tc.expectErr {
+				if err != nil {
+					return
+				}
+			} else if err != nil {
+				t.Fatalf("NewSchedulingSimulator failed: %v", err)
+			}
 
 			state, err := sim.NewClusterState(ctx)
 			if (err != nil) != tc.expectErr {
@@ -250,10 +313,18 @@ func TestNewClusterSnapshot(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(), 0)
-			broadcaster := events.NewBroadcaster(nil)
-			sim := NewSchedulingSimulator(tc.cfg, informerFactory, broadcaster)
+			client := fake.NewClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
 			ctx := t.Context()
+
+			sim, err := NewSchedulingSimulator(ctx, tc.cfg, informerFactory)
+			if tc.expectErr {
+				if err != nil {
+					return
+				}
+			} else if err != nil {
+				t.Fatalf("NewSchedulingSimulator failed: %v", err)
+			}
 
 			snapshot, err := sim.NewClusterSnapshot(ctx, nil, nil)
 			if (err != nil) != tc.expectErr {
@@ -265,4 +336,136 @@ func TestNewClusterSnapshot(t *testing.T) {
 		})
 	}
 
+}
+
+func TestNewClusterSnapshot_Scheduling(t *testing.T) {
+	ctx := context.Background()
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := NewSchedulingSimulator(ctx, cfg, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+
+	nodes := []*v1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "node1"},
+			Status: v1.NodeStatus{
+				Allocatable: v1.ResourceList{
+					v1.ResourcePods: *resource.NewQuantity(110, resource.DecimalSI),
+				},
+				Capacity: v1.ResourceList{
+					v1.ResourcePods: *resource.NewQuantity(110, resource.DecimalSI),
+				},
+			},
+		},
+	}
+
+	snap, err := sim.NewClusterSnapshot(ctx, nil, nodes)
+	if err != nil {
+		t.Fatalf("failed to create snapshot: %v", err)
+	}
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod1",
+			Namespace: "default",
+			UID:       types.UID("uid-pod1"),
+		},
+	}
+
+	results, err := snap.SchedulePods(ctx, klog.FromContext(ctx), []snapshot.SchedulablePod{
+		{Pod: pod, CandidateNodeNames: []string{"node1"}},
+	}, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("SchedulePods failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Expected 1 result, got %d", len(results))
+	}
+	if !results[0].Status.IsSuccess() {
+		t.Errorf("Expected scheduling success, got: %v", results[0].Status)
+	}
+	if results[0].SelectedNodeName != "node1" {
+		t.Errorf("Expected pod to be scheduled on node1, got %q", results[0].SelectedNodeName)
+	}
+}
+
+func TestClusterState_Scheduling(t *testing.T) {
+	ctx := context.Background()
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := NewSchedulingSimulator(ctx, cfg, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+
+	state, err := sim.NewClusterState(ctx)
+	if err != nil {
+		t.Fatalf("failed to create cluster state: %v", err)
+	}
+
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node1"},
+		Status: v1.NodeStatus{
+			Allocatable: v1.ResourceList{
+				v1.ResourcePods: *resource.NewQuantity(110, resource.DecimalSI),
+			},
+			Capacity: v1.ResourceList{
+				v1.ResourcePods: *resource.NewQuantity(110, resource.DecimalSI),
+			},
+		},
+	}
+	state.Cache.AddNode(klog.FromContext(ctx), node)
+
+	snap, err := state.Snapshot(klog.FromContext(ctx))
+	if err != nil {
+		t.Fatalf("failed to take snapshot: %v", err)
+	}
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod1",
+			Namespace: "default",
+			UID:       types.UID("uid-pod1"),
+		},
+	}
+
+	results, err := snap.SchedulePods(ctx, klog.FromContext(ctx), []snapshot.SchedulablePod{
+		{Pod: pod, CandidateNodeNames: []string{"node1"}},
+	}, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("SchedulePods failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Expected 1 result, got %d", len(results))
+	}
+	if !results[0].Status.IsSuccess() {
+		t.Errorf("Expected scheduling success, got: %v", results[0].Status)
+	}
+	if results[0].SelectedNodeName != "node1" {
+		t.Errorf("Expected pod to be scheduled on node1, got %q", results[0].SelectedNodeName)
+	}
 }

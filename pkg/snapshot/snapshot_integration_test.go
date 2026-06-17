@@ -23,7 +23,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
@@ -35,6 +34,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	upstreamsync "sigs.k8s.io/scheduler-library/pkg/upstream_sync"
 )
 
@@ -53,22 +53,11 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 
 	// 2. Initial Snapshot and Virtual Pod Scheduling
 	vpod1 := SchedulablePod{
-		Pod: &v1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: "vpod1", Namespace: "default", UID: "vuid1"},
-			Spec: v1.PodSpec{
-				Containers: []v1.Container{{
-					Resources: v1.ResourceRequirements{
-						Requests: v1.ResourceList{
-							v1.ResourceCPU: resource.MustParse("3"),
-						},
-					},
-				}},
-			},
-		},
+		Pod:                st.MakePod().Name("vpod1").Namespace("default").UID("uid-vpod1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "3"}).Obj(),
 		CandidateNodeNames: []string{"node1"},
 	}
 
-	_, err := cs.SchedulePods(ctx, sched, logger, []SchedulablePod{vpod1}, SchedulePodsOptions{})
+	_, err := cs.SchedulePods(ctx, logger, []SchedulablePod{vpod1}, SchedulePodsOptions{})
 	if err != nil {
 		t.Fatalf("failed to schedule virtual pod: %v", err)
 	}
@@ -118,67 +107,59 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 		for _, pSet := range wtd.preemptionSets {
 			logger.Info("Step 4: Trying combination", "pSet", pSet)
 			var currentPreemptions int
-			// Use a fresh snapshot for each simulation attempt to avoid transaction issues
-			// Append vpod1.Pod to pods for simulation so it is in NodeInfo.
-			simPods := append([]*v1.Pod{vpod1.Pod}, pods...)
-			csSim, _, schedSim := setupSnapshotTest(t, ctx, nodes, simPods)
-
-			for _, batch := range pSet {
-				logger.Info("Step 4: Preempting batch", "batch", batch)
-				_, err := csSim.PreemptPods(ctx, schedSim, batch)
-				if err != nil {
-					t.Fatalf("PreemptPods failed in simulation: %v", err)
-				}
-				currentPreemptions += len(batch)
-			}
-
-			logger.Info("Step 4: Before simulateWorkload")
-			fits, err := simulateWorkload(ctx, logger, csSim, schedSim, wtd.workload)
-			if err != nil {
-				t.Fatalf("simulateWorkload failed: %v", err)
-			}
-			logger.Info("Step 4: After simulateWorkload", "fits", fits)
-
+			var unpreemptions []*Unpreemption
 			var reducedSet PreemptionSet
-			if fits {
-				// Fill-back logic (reverse order)
-				reducedSet = pSet // Start with full set
-				for i := len(pSet) - 1; i >= 0; i-- {
-					batch := pSet[i]
-					// Try simulation WITHOUT this batch
-					csSimFB, _, schedFB := setupSnapshotTest(t, ctx, nodes, pods)
-					_, err := csSimFB.SchedulePods(ctx, schedFB, logger, []SchedulablePod{vpod1}, SchedulePodsOptions{})
+			var fitsOuter bool
+
+			txErr := cs.Transaction(ctx, logger, func() (TransactionResult, error) {
+				for _, batch := range pSet {
+					unpreempt, err := cs.PreemptPods(ctx, sched, batch)
 					if err != nil {
-						t.Fatalf("failed to schedule virtual pod in fill-back: %v", err)
+						return Revert, err
 					}
-
-					// Preempt all OTHER batches in reducedSet
-					for j, b := range reducedSet {
-						if j == i {
-							continue
-						}
-						_, err := csSimFB.PreemptPods(ctx, schedFB, b)
-						if err != nil {
-							t.Fatalf("PreemptPods failed in fill-back: %v", err)
-						}
-					}
-
-					fitsFB, err := simulateWorkload(ctx, logger, csSimFB, schedFB, wtd.workload)
-					if err != nil {
-						t.Fatalf("simulateWorkload failed in fill-back: %v", err)
-					}
-
-					if fitsFB {
-						// We don't need this batch! Remove it from reducedSet.
-						reducedSet = append(reducedSet[:i], reducedSet[i+1:]...)
-						currentPreemptions -= len(batch)
-					}
+					unpreemptions = append(unpreemptions, unpreempt)
+					currentPreemptions += len(batch)
 				}
-			} else {
-				reducedSet = pSet
+
+				fits, err := simulateWorkload(ctx, logger, cs, sched, wtd.workload)
+				if err != nil {
+					return Revert, err
+				}
+				fitsOuter = fits
+
+				if fits {
+					reducedSet = pSet
+					for i := len(unpreemptions) - 1; i >= 0; i-- {
+						u := unpreemptions[i]
+						batch := pSet[i]
+
+						_, err := cs.Unpreempt(u)
+						if err != nil {
+							return Revert, err
+						}
+
+						fitsFB, err := simulateWorkload(ctx, logger, cs, sched, wtd.workload)
+						if err != nil {
+							return Revert, err
+						}
+
+						if fitsFB {
+							reducedSet = append(reducedSet[:i], reducedSet[i+1:]...)
+							currentPreemptions -= len(batch)
+						} else {
+							u.RevertFn()
+						}
+					}
+				} else {
+					reducedSet = pSet
+				}
+				return Revert, nil
+			})
+			if txErr != nil {
+				t.Fatalf("Transaction failed: %v", txErr)
 			}
 
-			if fits && currentPreemptions < bestPreemptions {
+			if fitsOuter && currentPreemptions < bestPreemptions {
 				bestPreemptions = currentPreemptions
 				bestSet = reducedSet
 			}
@@ -192,9 +173,8 @@ func TestWorkloadSchedulingWithPreemptionAndFillBack(t *testing.T) {
 				if err != nil {
 					t.Fatalf("failed to apply preemption: %v", err)
 				}
-
 			}
-			results, err := cs.SchedulePodsByTemplate(ctx, sched, logger, wtd.workload.PodTemplate, []string{"node1"}, wtd.workload.TargetCount, SchedulePodsByTemplateOptions{})
+			results, err := cs.SchedulePodsByTemplate(ctx, logger, wtd.workload.PodTemplate, []string{"node1"}, wtd.workload.TargetCount, SchedulePodsByTemplateOptions{})
 			logger.Info("Step 5: SchedulePodsByTemplate results", "results", len(results), "err", err)
 			if err != nil {
 				t.Fatalf("failed to schedule workload: %v", err)
@@ -328,8 +308,9 @@ func setupSnapshotTest(t *testing.T, ctx context.Context, nodes []*v1.Node, pods
 		t.Fatalf("failed to update snapshot from cache: %v", err)
 	}
 
-	cs := NewClusterSnapshot(snap, sched.Profiles)
-	return cs, snap, upstreamsync.NewScheduler(sched, snap)
+	upstreamSched := upstreamsync.NewScheduler(sched, snap)
+	cs := New(snap, upstreamSched)
+	return cs, snap, upstreamSched
 }
 
 type Workload struct {
@@ -366,7 +347,7 @@ func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapsh
 		}
 	}
 
-	feasibleNodes, err := cs.CanSchedulePod(ctx, sched, logger, SchedulablePod{
+	feasibleNodes, _, err := cs.CanSchedulePod(ctx, logger, SchedulablePod{
 		Pod: &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "simulated-workload", Namespace: "default"},
 			Spec:       workload.PodTemplate.Spec,
@@ -381,7 +362,7 @@ func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapsh
 	logger.Info("simulateWorkload", "feasibleNodes", feasibleNodes)
 
 	if len(feasibleNodes) > 0 {
-		results, err := cs.SchedulePodsByTemplate(ctx, sched, logger, workload.PodTemplate, feasibleNodes, workload.TargetCount, NewSchedulePodsByTemplateOptions(true))
+		results, err := cs.SchedulePodsByTemplate(ctx, logger, workload.PodTemplate, feasibleNodes, workload.TargetCount, NewSchedulePodsByTemplateOptions(true))
 		if err != nil {
 			return false, err
 		}
@@ -396,21 +377,11 @@ func simulateWorkload(ctx context.Context, logger klog.Logger, cs *ClusterSnapsh
 func generateMockNodes(count int) []*v1.Node {
 	nodes := make([]*v1.Node, count)
 	for i := 0; i < count; i++ {
-		nodes[i] = &v1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("node%d", i)},
-			Status: v1.NodeStatus{
-				Allocatable: v1.ResourceList{
-					v1.ResourceCPU:    resource.MustParse("10"),
-					v1.ResourceMemory: resource.MustParse("10Gi"),
-					v1.ResourcePods:   resource.MustParse("110"),
-				},
-				Capacity: v1.ResourceList{
-					v1.ResourceCPU:    resource.MustParse("10"),
-					v1.ResourceMemory: resource.MustParse("10Gi"),
-					v1.ResourcePods:   resource.MustParse("110"),
-				},
-			},
-		}
+		nodes[i] = st.MakeNode().Name(fmt.Sprintf("node%d", i)).Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "10",
+			v1.ResourceMemory: "10Gi",
+			v1.ResourcePods:   "110",
+		}).Obj()
 	}
 	return nodes
 }
@@ -418,19 +389,7 @@ func generateMockNodes(count int) []*v1.Node {
 func generateMockPods(nodes []*v1.Node) []*v1.Pod {
 	pods := make([]*v1.Pod, len(nodes))
 	for i, node := range nodes {
-		pods[i] = &v1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pod%d", i), Namespace: "default", UID: types.UID(fmt.Sprintf("uid%d", i))},
-			Spec: v1.PodSpec{
-				NodeName: node.Name,
-				Containers: []v1.Container{{
-					Resources: v1.ResourceRequirements{
-						Requests: v1.ResourceList{
-							v1.ResourceCPU: resource.MustParse("5"),
-						},
-					},
-				}},
-			},
-		}
+		pods[i] = st.MakePod().Name(fmt.Sprintf("pod%d", i)).Namespace("default").UID(fmt.Sprintf("uid-pod%d", i)).Node(node.Name).Req(map[v1.ResourceName]string{v1.ResourceCPU: "5"}).Obj()
 	}
 	return pods
 }

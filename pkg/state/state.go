@@ -18,34 +18,26 @@ import (
 	"fmt"
 
 	"sigs.k8s.io/scheduler-library/pkg/snapshot"
+	upstreamsync "sigs.k8s.io/scheduler-library/pkg/upstream_sync"
 
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
-	"k8s.io/kubernetes/pkg/scheduler/profile"
 )
 
 type ClusterState struct {
 	Cache      cache.Cache
-	Frameworks profile.Map
+	sched      *upstreamsync.Scheduler
 	sharedSnap *cache.Snapshot
 }
 
-// NewClusterState creates a new ClusterState with an internal Kubernetes scheduler cache, frameworks,
+// New creates a new ClusterState with an internal Kubernetes scheduler cache, frameworks,
 // and the snapshot instance shared with all frameworks via WithSnapshotSharedLister.
-func NewClusterState(c cache.Cache, frameworks profile.Map, snap *cache.Snapshot) *ClusterState {
+func New(c cache.Cache, sched *upstreamsync.Scheduler, snap *cache.Snapshot) *ClusterState {
 	return &ClusterState{
 		Cache:      c,
-		Frameworks: frameworks,
+		sched:      sched,
 		sharedSnap: snap,
 	}
-}
-
-// Close closes all frameworks in the cluster state.
-func (s *ClusterState) Close() error {
-	if s.Frameworks != nil {
-		return s.Frameworks.Close()
-	}
-	return nil
 }
 
 // Snapshot constructs a snapshot from the current cluster state by updating the shared snapshot
@@ -55,10 +47,10 @@ func (s *ClusterState) Close() error {
 func (s *ClusterState) Snapshot(logger klog.Logger) (*snapshot.ClusterSnapshot, error) {
 	snap := s.sharedSnap
 	if snap == nil {
-		snap = cache.NewEmptySnapshot()
+		return nil, fmt.Errorf("sharedSnap is nil")
 	}
 	if err := s.Cache.UpdateSnapshot(logger, snap); err != nil {
 		return nil, fmt.Errorf("failed to update snapshot: %w", err)
 	}
-	return snapshot.NewClusterSnapshot(snap, s.Frameworks), nil
+	return snapshot.New(snap, s.sched), nil
 }

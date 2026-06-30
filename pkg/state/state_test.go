@@ -15,29 +15,25 @@
 package state
 
 import (
-	"fmt"
-	"sync"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	plugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
-	upstreamsync "sigs.k8s.io/scheduler-library/pkg/upstream_sync"
+	"sigs.k8s.io/scheduler-library/pkg/framework"
+	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
 
 func init() {
-	metrics.Register()
+	framework.InitMetricsOnce()
 }
 
 func TestClusterState_AddPod(t *testing.T) {
@@ -45,25 +41,27 @@ func TestClusterState_AddPod(t *testing.T) {
 		name         string
 		existingPods []*v1.Pod
 		podToAdd     *v1.Pod
-		expectCount  int
+		wantErr  bool
+		expected map[string][]string
 	}{
 		{
-			name:        "add unassigned pod",
-			podToAdd:    st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
-			expectCount: 1,
+			name:     "add unassigned pod",
+			podToAdd: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+			expected: map[string][]string{"node1": {}},
 		},
 		{
-			name:        "add assigned pod",
-			podToAdd:    st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
-			expectCount: 1,
+			name:     "add assigned pod",
+			podToAdd: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			expected: map[string][]string{"node1": {"pod1"}},
 		},
 		{
 			name: "add duplicate pod",
 			existingPods: []*v1.Pod{
-				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			},
-			podToAdd:    st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
-			expectCount: 1,
+			podToAdd: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			wantErr:  true,
+			expected: map[string][]string{"node1": {"pod1"}},
 		},
 	}
 
@@ -71,23 +69,32 @@ func TestClusterState_AddPod(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			logger := klog.FromContext(ctx)
-			state := New(cache.New(ctx, nil, false), newDummyScheduler(), nil)
+			sharedSnap := cache.NewEmptySnapshot()
+			state := New(cache.New(ctx, nil, false), newDummyProfileMap(), sharedSnap)
+
+			state.Cache.AddNode(logger, st.MakeNode().Name("node1").Obj())
 
 			for _, p := range tc.existingPods {
 				if err := state.Cache.AddPod(logger, p); err != nil {
-					t.Fatalf("Failed to add pod: %v", err)
+					t.Fatalf("Failed to add existing pod: %v", err)
 				}
 			}
 
-			_ = state.Cache.AddPod(logger, tc.podToAdd)
+			err := state.Cache.AddPod(logger, tc.podToAdd)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("AddPod() error = %v, wantErr = %v", err, tc.wantErr)
+			}
 
-			count, err := state.Cache.PodCount()
+			ft.VerifySnapshot(t, sharedSnap, nil)
+			csnap, err := state.Snapshot(logger)
 			if err != nil {
-				t.Fatalf("Failed to get pod count: %v", err)
+				t.Fatalf("Snapshot() error = %v", err)
 			}
-			if count != tc.expectCount {
-				t.Errorf("Expected pod count %d, got %d", tc.expectCount, count)
+			if csnap == nil {
+				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
+
+			ft.VerifySnapshot(t, sharedSnap, tc.expected)
 		})
 	}
 }
@@ -97,23 +104,25 @@ func TestClusterState_RemovePod(t *testing.T) {
 		name         string
 		existingPods []*v1.Pod
 		podToRemove  *v1.Pod
-		expectCount  int
+		wantErr     bool
+		expected    map[string][]string
 	}{
 		{
 			name: "remove existing pod",
 			existingPods: []*v1.Pod{
-				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			},
-			podToRemove: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
-			expectCount: 0,
+			podToRemove: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			expected:    map[string][]string{"node1": {}},
 		},
 		{
 			name: "remove non-existent pod",
 			existingPods: []*v1.Pod{
-				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			},
-			podToRemove: st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Obj(),
-			expectCount: 1,
+			podToRemove: st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Node("node1").Obj(),
+			wantErr:     true,
+			expected:    map[string][]string{"node1": {"pod1"}},
 		},
 	}
 
@@ -121,7 +130,10 @@ func TestClusterState_RemovePod(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			logger := klog.FromContext(ctx)
-			state := New(cache.New(ctx, nil, false), newDummyScheduler(), nil)
+			sharedSnap := cache.NewEmptySnapshot()
+			state := New(cache.New(ctx, nil, false), newDummyProfileMap(), sharedSnap)
+
+			state.Cache.AddNode(logger, st.MakeNode().Name("node1").Obj())
 
 			for _, p := range tc.existingPods {
 				if err := state.Cache.AddPod(logger, p); err != nil {
@@ -129,15 +141,21 @@ func TestClusterState_RemovePod(t *testing.T) {
 				}
 			}
 
-			_ = state.Cache.RemovePod(logger, tc.podToRemove)
+			err := state.Cache.RemovePod(logger, tc.podToRemove)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("RemovePod() error = %v, wantErr = %v", err, tc.wantErr)
+			}
 
-			count, err := state.Cache.PodCount()
+			ft.VerifySnapshot(t, sharedSnap, nil)
+			csnap, err := state.Snapshot(logger)
 			if err != nil {
-				t.Fatalf("Failed to get pod count: %v", err)
+				t.Fatalf("Snapshot() error = %v", err)
 			}
-			if count != tc.expectCount {
-				t.Errorf("Expected pod count %d, got %d", tc.expectCount, count)
+			if csnap == nil {
+				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
+
+			ft.VerifySnapshot(t, sharedSnap, tc.expected)
 		})
 	}
 }
@@ -147,7 +165,7 @@ func TestClusterState_AddNode(t *testing.T) {
 		name          string
 		existingNodes []*v1.Node
 		nodeToAdd     *v1.Node
-		expectCount   int
+		expected      map[string][]string
 	}{
 		{
 			name: "add valid node",
@@ -156,7 +174,7 @@ func TestClusterState_AddNode(t *testing.T) {
 				v1.ResourceMemory: "1Gi",
 				v1.ResourcePods:   "110",
 			}).Obj(),
-			expectCount: 1,
+			expected: map[string][]string{"node1": {}},
 		},
 		{
 			name: "add duplicate node",
@@ -172,7 +190,7 @@ func TestClusterState_AddNode(t *testing.T) {
 				v1.ResourceMemory: "1Gi",
 				v1.ResourcePods:   "110",
 			}).Obj(),
-			expectCount: 1,
+			expected: map[string][]string{"node1": {}},
 		},
 	}
 
@@ -180,7 +198,8 @@ func TestClusterState_AddNode(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			logger := klog.FromContext(ctx)
-			state := New(cache.New(ctx, nil, false), newDummyScheduler(), nil)
+			sharedSnap := cache.NewEmptySnapshot()
+			state := New(cache.New(ctx, nil, false), newDummyProfileMap(), sharedSnap)
 
 			for _, n := range tc.existingNodes {
 				state.Cache.AddNode(logger, n)
@@ -188,10 +207,16 @@ func TestClusterState_AddNode(t *testing.T) {
 
 			state.Cache.AddNode(logger, tc.nodeToAdd)
 
-			count := state.Cache.NodeCount()
-			if count != tc.expectCount {
-				t.Errorf("Expected node count %d, got %d", tc.expectCount, count)
+			ft.VerifySnapshot(t, sharedSnap, nil)
+			csnap, err := state.Snapshot(logger)
+			if err != nil {
+				t.Fatalf("Snapshot() error = %v", err)
 			}
+			if csnap == nil {
+				t.Fatal("Expected ClusterSnapshot to be non-nil")
+			}
+
+			ft.VerifySnapshot(t, sharedSnap, tc.expected)
 		})
 	}
 }
@@ -201,7 +226,8 @@ func TestClusterState_RemoveNode(t *testing.T) {
 		name          string
 		existingNodes []*v1.Node
 		nodeToRemove  *v1.Node
-		expectCount   int
+		wantErr       bool
+		expected      map[string][]string
 	}{
 		{
 			name: "remove existing node",
@@ -209,7 +235,7 @@ func TestClusterState_RemoveNode(t *testing.T) {
 				st.MakeNode().Name("node1").Obj(),
 			},
 			nodeToRemove: st.MakeNode().Name("node1").Obj(),
-			expectCount:  0,
+			expected:     map[string][]string{},
 		},
 		{
 			name: "remove non-existent node",
@@ -217,7 +243,8 @@ func TestClusterState_RemoveNode(t *testing.T) {
 				st.MakeNode().Name("node1").Obj(),
 			},
 			nodeToRemove: st.MakeNode().Name("node2").Obj(),
-			expectCount:  1,
+			wantErr:      true,
+			expected:     map[string][]string{"node1": {}},
 		},
 	}
 
@@ -225,18 +252,28 @@ func TestClusterState_RemoveNode(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			logger := klog.FromContext(ctx)
-			state := New(cache.New(ctx, nil, false), newDummyScheduler(), nil)
+			sharedSnap := cache.NewEmptySnapshot()
+			state := New(cache.New(ctx, nil, false), newDummyProfileMap(), sharedSnap)
 
 			for _, n := range tc.existingNodes {
 				state.Cache.AddNode(logger, n)
 			}
 
-			_ = state.Cache.RemoveNode(logger, tc.nodeToRemove)
-
-			count := state.Cache.NodeCount()
-			if count != tc.expectCount {
-				t.Errorf("Expected node count %d, got %d", tc.expectCount, count)
+			err := state.Cache.RemoveNode(logger, tc.nodeToRemove)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("RemoveNode() error = %v, wantErr = %v", err, tc.wantErr)
 			}
+
+			ft.VerifySnapshot(t, sharedSnap, nil)
+			csnap, err := state.Snapshot(logger)
+			if err != nil {
+				t.Fatalf("Snapshot() error = %v", err)
+			}
+			if csnap == nil {
+				t.Fatal("Expected ClusterSnapshot to be non-nil")
+			}
+
+			ft.VerifySnapshot(t, sharedSnap, tc.expected)
 		})
 	}
 }
@@ -246,10 +283,12 @@ func TestClusterState_Snapshot(t *testing.T) {
 		name          string
 		existingNodes []*v1.Node
 		existingPods  []*v1.Pod
-		hasFramework  bool
+		hasFramework bool
+		expected     map[string][]string
 	}{
 		{
-			name: "empty snapshot",
+			name:     "empty snapshot",
+			expected: map[string][]string{},
 		},
 		{
 			name: "snapshot with data",
@@ -257,8 +296,9 @@ func TestClusterState_Snapshot(t *testing.T) {
 				st.MakeNode().Name("node1").Obj(),
 			},
 			existingPods: []*v1.Pod{
-				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			},
+			expected: map[string][]string{"node1": {"pod1"}},
 		},
 		{
 			name: "snapshot in sync with framework snapshot",
@@ -269,15 +309,18 @@ func TestClusterState_Snapshot(t *testing.T) {
 				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			},
 			hasFramework: true,
+			expected:     map[string][]string{"node1": {"pod1"}},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
+			logger := klog.FromContext(ctx)
 
-			var sched *upstreamsync.Scheduler
+			var profiles *upstreamsync.ProfileMap
 			sharedSnap := cache.NewEmptySnapshot()
+
 			if tc.hasFramework {
 				informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(), 0)
 				registry := plugins.NewInTreeRegistry()
@@ -291,19 +334,16 @@ func TestClusterState_Snapshot(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to create framework: %v", err)
 				}
-				sched = &upstreamsync.Scheduler{
-					Scheduler: &scheduler.Scheduler{
-						Profiles: profile.Map{
-							"default-scheduler": fwk,
-						},
+				profiles = &upstreamsync.ProfileMap{
+					Map: profile.Map{
+						"default-scheduler": fwk,
 					},
 				}
 			} else {
-				sched = newDummyScheduler()
+				profiles = newDummyProfileMap()
 			}
 
-			state := New(cache.New(ctx, nil, false), sched, sharedSnap)
-			logger := klog.FromContext(ctx)
+			state := New(cache.New(ctx, nil, false), profiles, sharedSnap)
 
 			for _, n := range tc.existingNodes {
 				state.Cache.AddNode(logger, n)
@@ -314,187 +354,128 @@ func TestClusterState_Snapshot(t *testing.T) {
 				}
 			}
 
-			snap, err := state.Snapshot(logger)
+			ft.VerifySnapshot(t, sharedSnap, nil)
+			csnap, err := state.Snapshot(logger)
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
 			}
-			if snap == nil {
-				t.Fatal("Expected snapshot to be non-nil")
+			if csnap == nil {
+				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
 
-			if tc.hasFramework {
-				for _, n := range tc.existingNodes {
-					nodeInfo, err := sharedSnap.NodeInfos().Get(n.Name)
-					if err != nil {
-						t.Fatalf("Failed to get node %s from shared framework snapshot: %v", n.Name, err)
-					}
-					if nodeInfo == nil {
-						t.Fatalf("Expected nodeInfo for node %s to be non-nil", n.Name)
-					}
+			ft.VerifySnapshot(t, sharedSnap, tc.expected)
+		})
+	}
+}
 
-					expectedPods := make(map[string]bool)
-					for _, p := range tc.existingPods {
-						if p.Spec.NodeName == n.Name {
-							expectedPods[p.Name] = true
-						}
-					}
+func TestClusterState_SequentialUpdates(t *testing.T) {
+	type action func(t *testing.T, state *ClusterState)
 
-					pods := nodeInfo.GetPods()
-					if len(pods) != len(expectedPods) {
-						t.Fatalf("Expected %d pods on node %s in shared framework snapshot, got %d", len(expectedPods), n.Name, len(pods))
-					}
+	addPod := func(pod *v1.Pod) action {
+		return func(t *testing.T, state *ClusterState) {
+			t.Helper()
+			if err := state.Cache.AddPod(klog.FromContext(t.Context()), pod); err != nil {
+				t.Fatalf("AddPod() error = %v", err)
+			}
+		}
+	}
+	addNode := func(node *v1.Node) action {
+		return func(t *testing.T, state *ClusterState) {
+			t.Helper()
+			state.Cache.AddNode(klog.FromContext(t.Context()), node)
+		}
+	}
+	removePod := func(pod *v1.Pod) action {
+		return func(t *testing.T, state *ClusterState) {
+			t.Helper()
+			if err := state.Cache.RemovePod(klog.FromContext(t.Context()), pod); err != nil {
+				t.Fatalf("RemovePod() error = %v", err)
+			}
+		}
+	}
+	removeNode := func(node *v1.Node) action {
+		return func(t *testing.T, state *ClusterState) {
+			t.Helper()
+			if err := state.Cache.RemoveNode(klog.FromContext(t.Context()), node); err != nil {
+				t.Fatalf("RemoveNode() error = %v", err)
+			}
+		}
+	}
 
-					for _, podInfo := range pods {
-						podName := podInfo.GetPod().Name
-						if !expectedPods[podName] {
-							t.Fatalf("Unexpected pod %s on node %s in shared framework snapshot", podName, n.Name)
-						}
-					}
-				}
+	updateSnapshot := func() action {
+		return func(t *testing.T, state *ClusterState) {
+			t.Helper()
+			csnap, err := state.Snapshot(klog.FromContext(t.Context()))
+			if err != nil {
+				t.Fatalf("Snapshot() error = %v", err)
+			}
+			if csnap == nil {
+				t.Fatal("Expected ClusterSnapshot to be non-nil")
+			}
+		}
+	}
+
+	assertSnapshot := func(expected map[string][]string) action {
+		return func(t *testing.T, state *ClusterState) {
+			t.Helper()
+			ft.VerifySnapshot(t, state.sharedSnap, expected)
+		}
+	}
+
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj()
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "1",
+		v1.ResourceMemory: "1Gi",
+		v1.ResourcePods:   "110",
+	}).Obj()
+
+	tests := []struct {
+		name  string
+		steps []action
+	}{
+		{
+			name: "pod assigned to non-existent node then node added",
+			steps: []action{
+				addPod(pod1),
+				updateSnapshot(),
+				assertSnapshot(map[string][]string{}),
+				addNode(node1),
+				updateSnapshot(),
+				assertSnapshot(map[string][]string{"node1": {"pod1"}}),
+			},
+		},
+		{
+			name: "node removal while pods still exist",
+			steps: []action{
+				addNode(node1),
+				addPod(pod1),
+				updateSnapshot(),
+				assertSnapshot(map[string][]string{"node1": {"pod1"}}),
+				removeNode(node1),
+				updateSnapshot(),
+				assertSnapshot(map[string][]string{}),
+				removePod(pod1),
+				updateSnapshot(),
+				assertSnapshot(map[string][]string{}),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			sharedSnap := cache.NewEmptySnapshot()
+			state := New(cache.New(ctx, nil, false), newDummyProfileMap(), sharedSnap)
+
+			for _, step := range tc.steps {
+				step(t, state)
 			}
 		})
 	}
 }
 
-func TestClusterState_ComplexScenarios(t *testing.T) {
-	t.Run("pod assigned to non-existent node", func(t *testing.T) {
-		ctx := t.Context()
-		logger := klog.FromContext(ctx)
-		state := New(cache.New(ctx, nil, false), newDummyScheduler(), nil)
-
-		pod := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj()
-
-		// Add pod first
-		if err := state.Cache.AddPod(logger, pod); err != nil {
-			t.Fatalf("Failed to add pod: %v", err)
-		}
-
-		// Verify pod count
-		pCount, err := state.Cache.PodCount()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if pCount != 1 {
-			t.Errorf("Expected pod count 1, got %d", pCount)
-		}
-
-		// Add node later
-		node := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
-			v1.ResourceCPU:    "1",
-			v1.ResourceMemory: "1Gi",
-			v1.ResourcePods:   "110",
-		}).Obj()
-		state.Cache.AddNode(logger, node)
-
-		// Verify node count
-		nCount := state.Cache.NodeCount()
-		if nCount != 1 {
-			t.Errorf("Expected node count 1, got %d", nCount)
-		}
-	})
-
-	t.Run("node removal with pods", func(t *testing.T) {
-		ctx := t.Context()
-		logger := klog.FromContext(ctx)
-		state := New(cache.New(ctx, nil, false), newDummyScheduler(), nil)
-
-		node := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
-			v1.ResourceCPU:    "1",
-			v1.ResourceMemory: "1Gi",
-			v1.ResourcePods:   "110",
-		}).Obj()
-		pod := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj()
-
-		state.Cache.AddNode(logger, node)
-		if err := state.Cache.AddPod(logger, pod); err != nil {
-			t.Fatalf("Failed to add pod: %v", err)
-		}
-
-		// Remove node
-		if err := state.Cache.RemoveNode(logger, node); err != nil {
-			t.Fatalf("Failed to remove node: %v", err)
-		}
-
-		// Verify node count is still 1 (ghost node) because pod still exists
-		nCount := state.Cache.NodeCount()
-		if nCount != 1 {
-			t.Errorf("Expected node count 1 (ghost node), got %d", nCount)
-		}
-
-		// Verify pod count is still 1
-		pCount, err := state.Cache.PodCount()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if pCount != 1 {
-			t.Errorf("Expected pod count 1, got %d", pCount)
-		}
-
-		// Now remove the pod
-		if err := state.Cache.RemovePod(logger, pod); err != nil {
-			t.Fatalf("Failed to remove pod: %v", err)
-		}
-
-		// Verify node count becomes 0 after pod is removed
-		nCount = state.Cache.NodeCount()
-		if nCount != 0 {
-			t.Errorf("Expected node count 0 after pod removal, got %d", nCount)
-		}
-	})
-}
-
-func TestClusterState_ConcurrentAccess(t *testing.T) {
-	ctx := t.Context()
-	state := New(cache.New(ctx, nil, false), newDummyScheduler(), cache.NewEmptySnapshot())
-
-	const numGoroutines = 20
-	const numOperations = 50
-
-	var wg sync.WaitGroup
-	wg.Add(numGoroutines)
-
-	for i := 0; i < numGoroutines; i++ {
-		go func(id int) {
-			defer wg.Done()
-			logger := klog.FromContext(ctx)
-			for j := range numOperations {
-				pod := &v1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      fmt.Sprintf("pod-%d-%d", id, j),
-						Namespace: "default",
-						UID:       types.UID(fmt.Sprintf("uid-%d-%d", id, j)),
-					},
-				}
-				node := &v1.Node{
-					ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("node-%d-%d", id, j)},
-				}
-
-				state.Cache.AddNode(logger, node)
-				if err := state.Cache.AddPod(logger, pod); err != nil {
-					// Concurrent access might cause some pods to already exist if not careful,
-					// but here names are unique by goroutine id and iteration j.
-					t.Errorf("Failed to add pod: %v", err)
-				}
-				if _, err := state.Snapshot(logger); err != nil {
-					t.Errorf("Snapshot() error = %v", err)
-				}
-				if err := state.Cache.RemovePod(logger, pod); err != nil {
-					t.Errorf("Failed to remove pod: %v", err)
-				}
-				if err := state.Cache.RemoveNode(logger, node); err != nil {
-					t.Errorf("Failed to remove node: %v", err)
-				}
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-func newDummyScheduler() *upstreamsync.Scheduler {
-	return &upstreamsync.Scheduler{
-		Scheduler: &scheduler.Scheduler{
-			Profiles: make(profile.Map),
-		},
+func newDummyProfileMap() *upstreamsync.ProfileMap {
+	return &upstreamsync.ProfileMap{
+		Map: make(profile.Map),
 	}
 }

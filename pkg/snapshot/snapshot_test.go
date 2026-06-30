@@ -16,323 +16,434 @@ package snapshot
 
 import (
 	"context"
-
-	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"fmt"
-	"sort"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/scheduler/metrics"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 )
 
-func init() {
-	metrics.Register()
+type stepContext struct {
+	ctx     context.Context
+	cs      *ClusterSnapshot
+	snap    *cache.Snapshot
+	pods    map[string]*v1.Pod
+	handles map[string]*Unpreemption
 }
 
-func TestPreemptionSnapshot(t *testing.T) {
-	nodes := []*v1.Node{st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
-		v1.ResourceCPU:    "1",
-		v1.ResourceMemory: "1Gi",
-		v1.ResourcePods:   "110",
-	}).Obj()}
-	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj()
-	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Node("node1").Obj()
+type stepFn func(t *testing.T, sc *stepContext)
 
-	t.Run("Preempt outside transaction", func(t *testing.T) {
-		ctx := t.Context()
-		cs, _, _ := setupSnapshotTest(t, ctx, nodes, []*v1.Pod{pod1, pod2})
-		initialVersion := cs.stateVersion
-		u, err := cs.PreemptPods(ctx, nil, []*v1.Pod{pod1})
+func preempt(handleKey string, podNames ...string) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		var pods []*v1.Pod
+		for _, name := range podNames {
+			p, ok := sc.pods[name]
+			if !ok {
+				t.Fatalf("preempt: pod %q not found in stepContext", name)
+			}
+			pods = append(pods, p)
+		}
+		handle, err := sc.cs.PreemptPods(sc.ctx, pods)
 		if err != nil {
-			t.Fatalf("PreemptPods failed: %v", err)
+			t.Fatalf("PreemptPods(%v) unexpected error: %v", podNames, err)
 		}
-		if u != nil {
-			t.Errorf("Expected nil preemption handle outside transaction")
-		}
-		_, err = cs.Unpreempt(u)
-		if err == nil {
-			t.Errorf("Expected Unpreempt with nil handle to fail")
-		}
-		if cs.stateVersion != initialVersion+1 {
-			t.Errorf("Expected stateVersion to be incremented, got %d, want %d", cs.stateVersion, initialVersion+1)
-		}
-		nodeInfo, err := cs.schedulerSnapshot.NodeInfos().Get("node1")
-		if err != nil {
-			t.Fatalf("failed to get node info: %v", err)
-		}
-		foundPod1 := false
-		for _, pInfo := range nodeInfo.GetPods() {
-			if pInfo.GetPod().Name == "pod1" {
-				foundPod1 = true
-			}
-		}
-		if foundPod1 {
-			t.Errorf("Expected pod1 to be removed from nodeInfo")
-		}
-	})
-
-	t.Run("Unpreempt in transaction", func(t *testing.T) {
-		ctx := t.Context()
-		cs, _, _ := setupSnapshotTest(t, ctx, nodes, []*v1.Pod{pod1, pod2})
-		err := cs.Transaction(ctx, klog.FromContext(ctx), func() (TransactionResult, error) {
-			uA, err := cs.PreemptPods(ctx, nil, []*v1.Pod{pod1})
-			if err != nil {
-				return Revert, err
-			}
-			uB, err := cs.PreemptPods(ctx, nil, []*v1.Pod{pod2})
-			if err != nil {
-				return Revert, err
-			}
-
-			// Unpreempt A first (non-LIFO / arbitrary order). Should succeed.
-			_, err = cs.Unpreempt(uA)
-			if err != nil {
-				t.Errorf("Expected Unpreempt A to succeed, got: %v", err)
-			}
-
-			// Unpreempt B next. Should succeed.
-			_, err = cs.Unpreempt(uB)
-			if err != nil {
-				t.Errorf("Expected Unpreempt B to succeed, got: %v", err)
-			}
-
-			return Commit, nil
-		})
-		if err != nil {
-			t.Fatalf("Transaction failed: %v", err)
-		}
-	})
-
-	t.Run("Committed transaction handle reuse fails", func(t *testing.T) {
-		ctx := t.Context()
-		cs, _, _ := setupSnapshotTest(t, ctx, nodes, []*v1.Pod{pod1, pod2})
-		var u *Unpreemption
-		err := cs.Transaction(ctx, klog.FromContext(ctx), func() (TransactionResult, error) {
-			var txErr error
-			u, txErr = cs.PreemptPods(ctx, nil, []*v1.Pod{pod1})
-			if txErr != nil {
-				return Revert, txErr
-			}
-			return Commit, nil
-		})
-		if err != nil {
-			t.Fatalf("Transaction failed: %v", err)
-		}
-
-		// Now try to unpreempt inside a new transaction. It should fail because the handle is from a previous transaction.
-		err = cs.Transaction(ctx, klog.FromContext(ctx), func() (TransactionResult, error) {
-			_, err = cs.Unpreempt(u)
-			if err == nil {
-				t.Errorf("Expected Unpreempt to fail using handle from a committed transaction")
-			}
-			return Commit, nil
-		})
-		if err != nil {
-			t.Fatalf("Transaction failed: %v", err)
-		}
-	})
+		sc.handles[handleKey] = handle
+	}
 }
 
-func TestPreemptionTransactionLifecycle(t *testing.T) {
-	ctx := t.Context()
-	nodes := []*v1.Node{st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
-		v1.ResourceCPU:    "1",
-		v1.ResourceMemory: "1Gi",
-		v1.ResourcePods:   "110",
-	}).Obj()}
-	pod := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj()
+func preemptErr(wantErr string, podNames ...string) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		var pods []*v1.Pod
+		for _, name := range podNames {
+			p, ok := sc.pods[name]
+			if !ok {
+				t.Fatalf("preemptErr: pod %q not found in stepContext", name)
+			}
+			pods = append(pods, p)
+		}
+		_, err := sc.cs.PreemptPods(sc.ctx, pods)
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Fatalf("PreemptPods(%v) expected error containing %q, got: %v", podNames, wantErr, err)
+		}
+	}
+}
+
+func unpreempt(handleKey string) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		handle := sc.handles[handleKey]
+		_, err := sc.cs.Unpreempt(handle)
+		if err != nil {
+			t.Fatalf("Unpreempt(%q) unexpected error: %v", handleKey, err)
+		}
+	}
+}
+
+func unpreemptErr(handleKey string, wantErr string) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		var handle *Unpreemption
+		if handleKey != "nil" {
+			handle = sc.handles[handleKey]
+		}
+		_, err := sc.cs.Unpreempt(handle)
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Fatalf("Unpreempt(%q) expected error containing %q, got: %v", handleKey, wantErr, err)
+		}
+	}
+}
+
+func schedule(podNames []string, candidateNodes []string, opts SchedulePodsOptions) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		var schedPods []*SchedulablePod
+		for _, name := range podNames {
+			p, ok := sc.pods[name]
+			if !ok {
+				t.Fatalf("schedule: pod %q not found in stepContext", name)
+			}
+			schedPods = append(schedPods, &SchedulablePod{
+				Pod:                p,
+				CandidateNodeNames: candidateNodes,
+			})
+		}
+		_, err := sc.cs.SchedulePods(sc.ctx, schedPods, opts)
+		if err != nil {
+			t.Fatalf("SchedulePods(%v) unexpected error: %v", podNames, err)
+		}
+	}
+}
+
+func canSchedule(podName string, candidateNodes []string) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		p, ok := sc.pods[podName]
+		if !ok {
+			t.Fatalf("canSchedule: pod %q not found in stepContext", podName)
+		}
+		sp := SchedulablePod{Pod: p, CandidateNodeNames: candidateNodes}
+		_, _, err := sc.cs.CanSchedulePod(sc.ctx, sp)
+		if err != nil {
+			t.Fatalf("CanSchedulePod(%q) unexpected error: %v", podName, err)
+		}
+	}
+}
+
+func verifySnapshot(expected map[string][]string) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		ft.VerifySnapshot(t, sc.snap, expected)
+	}
+}
+
+func inTransaction(result TransactionResult, steps ...stepFn) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		err := sc.cs.Transaction(sc.ctx, func() (TransactionResult, error) {
+			for _, step := range steps {
+				step(t, sc)
+			}
+			return result, nil
+		})
+		if err != nil {
+			t.Fatalf("Transaction failed unexpectedly: %v", err)
+		}
+	}
+}
+
+func inTransactionReturnErr(wantErr string, steps ...stepFn) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		err := sc.cs.Transaction(sc.ctx, func() (TransactionResult, error) {
+			for _, step := range steps {
+				step(t, sc)
+			}
+			return Commit, fmt.Errorf("%s", wantErr)
+		})
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Fatalf("Transaction expected error containing %q, got: %v", wantErr, err)
+		}
+	}
+}
+
+func expectNestedTxErr() stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		err := sc.cs.Transaction(sc.ctx, func() (TransactionResult, error) {
+			return Commit, nil
+		})
+		wantErr := "a transaction is already in progress"
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Fatalf("Nested transaction expected error containing %q, got: %v", wantErr, err)
+		}
+	}
+}
+
+func TestSnapshot_ActionSequences(t *testing.T) {
+	ctx := context.Background()
+	nodes := []*v1.Node{
+		st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "10",
+			v1.ResourceMemory: "10Gi",
+			v1.ResourcePods:   "110",
+		}).Obj(),
+		st.MakeNode().Name("singlePodNode").Capacity(map[v1.ResourceName]string{
+			v1.ResourcePods: "1",
+		}).Obj(),
+	}
+
+	pod := st.MakePod().Name("pod").Namespace("default").UID("uid-pod").Obj()
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj()
+	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Obj()
+	pod3 := st.MakePod().Name("pod3").Namespace("default").UID("uid-pod3").Obj()
+	podNoNode := st.MakePod().Name("podNoNode").Namespace("default").UID("uid-nonode").Obj()
+
+	allPods := []*v1.Pod{pod1, pod2, pod3, pod, podNoNode}
 
 	tests := []struct {
 		name         string
-		unpreempt    bool
-		resultAction TransactionResult
-		expectBack   bool
+		assignedPods map[string][]string
+		steps        []stepFn
 	}{
 		{
-			name:         "Unpreempt inside transaction restores pod",
-			unpreempt:    true,
-			resultAction: Commit,
-			expectBack:   true,
+			name:         "Preempt outside transaction and unpreempt",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				verifySnapshot(map[string][]string{"node1": {}}),
+				unpreempt("u1"),
+				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+			},
 		},
 		{
-			name:         "Rollback transaction restores pod",
-			unpreempt:    false,
-			resultAction: Revert,
-			expectBack:   true,
+			name:         "Unpreempt inside committed transaction in non-LIFO order",
+			assignedPods: map[string][]string{"node1": {"pod1", "pod2"}},
+			steps: []stepFn{
+				inTransaction(Commit,
+					preempt("uA", "pod1"),
+					preempt("uB", "pod2"),
+					verifySnapshot(map[string][]string{"node1": {}}),
+					unpreempt("uA"),
+					verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+					unpreempt("uB"),
+					verifySnapshot(map[string][]string{"node1": {"pod1", "pod2"}}),
+				),
+				verifySnapshot(map[string][]string{"node1": {"pod1", "pod2"}}),
+			},
 		},
 		{
-			name:         "Commit transaction without unpreempt keeps pod preempted",
-			unpreempt:    false,
-			resultAction: Commit,
-			expectBack:   false,
+			name:         "Mixed preempt and schedule inside reverted transaction rolls back in reverse order",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				inTransaction(Revert,
+					preempt("u1", "pod1"),
+					verifySnapshot(map[string][]string{"node1": {}}),
+					schedule([]string{"pod"}, []string{"node1"}, SchedulePodsOptions{}),
+					verifySnapshot(map[string][]string{"node1": {"pod"}}),
+				),
+				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+			},
+		},
+		{
+			name:         "Non-LIFO unpreemptions inside reverted transaction restore pre-transaction state",
+			assignedPods: map[string][]string{"node1": {"pod1", "pod2", "pod3"}},
+			steps: []stepFn{
+				inTransaction(Revert,
+					preempt("u1", "pod1"),
+					preempt("u2", "pod2"),
+					preempt("u3", "pod3"),
+					verifySnapshot(map[string][]string{"node1": {}}),
+					// Out-of-order unpreemptions
+					unpreempt("u2"),
+					verifySnapshot(map[string][]string{"node1": {"pod2"}}),
+					unpreempt("u1"),
+					verifySnapshot(map[string][]string{"node1": {"pod1", "pod2"}}),
+				),
+				verifySnapshot(map[string][]string{"node1": {"pod1", "pod2", "pod3"}}),
+			},
+		},
+		{
+			name:         "PreemptPods fails midway when pod has no node name, restoring prior pods in same call",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preemptErr("has no node name", "pod1", "podNoNode"),
+				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+			},
+		},
+		{
+			name:         "Handle invalidated by committed transaction",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				inTransaction(Commit, schedule([]string{"pod"}, []string{"node1"}, SchedulePodsOptions{})),
+				unpreemptErr("u1", "preemption handle is invalid: snapshot has been permanently mutated since preemption"),
+			},
+		},
+		{
+			name:         "Handle not invalidated by reverted transaction",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				inTransaction(Revert, schedule([]string{"pod"}, []string{"node1"}, SchedulePodsOptions{})),
+				unpreempt("u1"),
+			},
+		},
+		{
+			name:         "Handle invalidated by permanent SchedulePods mutation",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				schedule([]string{"pod"}, []string{"node1"}, SchedulePodsOptions{}),
+				unpreemptErr("u1", "preemption handle is invalid: snapshot has been permanently mutated since preemption"),
+			},
+		},
+		{
+			name:         "Handle not invalidated by dry-run SchedulePods or read-only CanSchedulePod",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				canSchedule("pod", []string{"node1"}),
+				schedule([]string{"pod"}, []string{"node1"}, NewSchedulePodsOptions(true, false)),
+				unpreempt("u1"),
+				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+			},
+		},
+		{
+			name:         "Preemption handle created in transaction fails to unpreempt in another transaction",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				inTransaction(Commit, preempt("u1", "pod1")),
+				inTransaction(Commit, unpreemptErr("u1", "preemption handle is invalid")),
+			},
+		},
+		{
+			name:         "Preemption handle created in committed transaction fails to unpreempt outside of transaction",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				inTransaction(Commit, preempt("u1", "pod1")),
+				unpreemptErr("u1", "preemption handle is invalid"),
+			},
+		},
+		{
+			name:         "Preemption handle created in reverted transaction fails to unpreempt outside of transaction",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				inTransaction(Revert, preempt("u1", "pod1")),
+				unpreemptErr("u1", "preemption handle is invalid"),
+			},
+		},
+		{
+			name:         "Preemption handle created outside of transaction fails to unpreempt in transaction",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				inTransaction(Commit, unpreemptErr("u1", "preemption handle is invalid")),
+			},
+		},
+		{
+			name:         "Calling Unpreempt second time on the same handle returns error",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				unpreempt("u1"),
+				unpreemptErr("u1", "already unpreempted"),
+			},
+		},
+		{
+			name:         "Unpreempt nil handle returns error",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				unpreemptErr("nil", "preemption handle is nil"),
+			},
+		},
+		{
+			name:         "Transaction returning error automatically rolls back changes",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				inTransactionReturnErr("simulated transaction error",
+					preempt("u1", "pod1"),
+					verifySnapshot(map[string][]string{"node1": {}}),
+				),
+				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+			},
+		},
+		{
+			name:         "Nested transaction returns error",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				inTransaction(Commit,
+					expectNestedTxErr(),
+				),
+			},
+		},
+		{
+			name: "SchedulePods observes mutations",
+			assignedPods: map[string][]string{
+				"singlePodNode": {},
+				"node1":         {}},
+			steps: []stepFn{
+				inTransaction(Revert,
+					schedule([]string{"pod"}, []string{"singlePodNode"}, SchedulePodsOptions{}),
+					schedule([]string{"pod1"}, []string{"singlePodNode"}, SchedulePodsOptions{}),
+					verifySnapshot(map[string][]string{
+						"singlePodNode": {"pod"},
+						"node1":         {}}),
+					schedule([]string{"pod1"}, []string{"node1"}, SchedulePodsOptions{}),
+					verifySnapshot(map[string][]string{
+						"singlePodNode": {"pod"},
+						"node1":         {"pod1"}}),
+				),
+				schedule([]string{"pod1"}, []string{"singlePodNode"}, SchedulePodsOptions{}),
+				verifySnapshot(map[string][]string{
+					"singlePodNode": {"pod1"},
+					"node1":         {}}),
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cs, snap, _ := setupSnapshotTest(t, ctx, nodes, []*v1.Pod{pod})
-
-			err := cs.Transaction(ctx, klog.FromContext(ctx), func() (TransactionResult, error) {
-				// Preempt the pod.
-				u, err := cs.PreemptPods(ctx, nil, []*v1.Pod{pod})
-				if err != nil {
-					return Revert, err
-				}
-
-				// Verify pod is gone.
-				nodeInfo, err := snap.NodeInfos().Get("node1")
-				if err != nil {
-					return Revert, err
-				}
-				if len(nodeInfo.GetPods()) != 0 {
-					return Revert, fmt.Errorf("expected 0 pods after preemption, got %d", len(nodeInfo.GetPods()))
-				}
-
-				if tc.unpreempt {
-					// Restore via Unpreempt.
-					if _, err := cs.Unpreempt(u); err != nil {
-						return Revert, err
+			podMap := make(map[string]*v1.Pod)
+			for _, p := range allPods {
+				podMap[p.Name] = p.DeepCopy()
+			}
+			nodeMap := make(map[string]*v1.Node)
+			for _, n := range nodes {
+				nodeMap[n.Name] = n
+			}
+			var assignedPods []*v1.Pod
+			var nodesForTest []*v1.Node
+			for nodeName, podNames := range tc.assignedPods {
+				for _, podName := range podNames {
+					p, ok := podMap[podName]
+					if !ok {
+						t.Fatalf("assigned pod %q not found in predefined pods", podName)
 					}
+					p.Spec.NodeName = nodeName
+					assignedPods = append(assignedPods, p)
 				}
-
-				return tc.resultAction, nil
-			})
-			if err != nil {
-				t.Fatalf("Transaction failed: %v", err)
+				nodesForTest = append(nodesForTest, nodeMap[nodeName])
 			}
 
-			// Verify pod state on node after transaction finishes
-			nodeInfo, err := snap.NodeInfos().Get("node1")
-			if err != nil {
-				t.Fatalf("failed to get node info: %v", err)
+			cs, snap, _ := setupSnapshotTest(t, ctx, nodesForTest, assignedPods)
+			sc := &stepContext{
+				ctx:     ctx,
+				cs:      cs,
+				snap:    snap,
+				pods:    podMap,
+				handles: make(map[string]*Unpreemption),
 			}
-			podsCount := len(nodeInfo.GetPods())
-			if tc.expectBack {
-				if podsCount != 1 {
-					t.Errorf("expected pod to be restored, but node has %d pods", podsCount)
-				}
-			} else {
-				if podsCount != 0 {
-					t.Errorf("expected pod to remain preempted, but node has %d pods", podsCount)
-				}
-			}
-		})
-	}
-}
-
-func TestTransaction(t *testing.T) {
-	tests := []struct {
-		name             string
-		transactionFn    func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error)
-		expectErr        bool
-		expectStackEmpty bool
-		checkResult      func(t *testing.T, revertCalled bool, state map[string]any)
-	}{
-		{
-			name: "Commit does not roll back",
-			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
-				cs.txCompensations = append(cs.txCompensations, &txMutation{
-					revertFn: func() { *revertCalled = true },
-					active:   true,
-				})
-				return Commit, nil
-			},
-			expectErr:        false,
-			expectStackEmpty: true,
-			checkResult: func(t *testing.T, revertCalled bool, state map[string]any) {
-				if revertCalled {
-					t.Errorf("Expected revert NOT to be called on committed transaction")
-				}
-			},
-		},
-		{
-			name: "Revert rolls back",
-			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
-				cs.txCompensations = append(cs.txCompensations, &txMutation{
-					revertFn: func() { *revertCalled = true },
-					active:   true,
-				})
-				return Revert, nil
-			},
-			expectErr:        false,
-			expectStackEmpty: true,
-			checkResult: func(t *testing.T, revertCalled bool, state map[string]any) {
-				if !revertCalled {
-					t.Errorf("Expected revert to be called on reverted transaction")
-				}
-			},
-		},
-		{
-			name: "Error rolls back automatically",
-			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
-				cs.txCompensations = append(cs.txCompensations, &txMutation{
-					revertFn: func() { *revertCalled = true },
-					active:   true,
-				})
-				return Commit, fmt.Errorf("some error")
-			},
-			expectErr:        true,
-			expectStackEmpty: true,
-			checkResult: func(t *testing.T, revertCalled bool, state map[string]any) {
-				if !revertCalled {
-					t.Errorf("Expected revert to be called on error transaction exit")
-				}
-			},
-		},
-		{
-			name: "Nested transaction fails",
-			transactionFn: func(cs *ClusterSnapshot, revertCalled *bool, state map[string]any) (TransactionResult, error) {
-				err := cs.Transaction(context.TODO(), klog.Background(), func() (TransactionResult, error) {
-					return Commit, nil
-				})
-				if err == nil {
-					return Revert, fmt.Errorf("expected nested transaction to fail")
-				}
-				state["nested_err"] = err
-				return Commit, nil
-			},
-			expectErr:        false,
-			expectStackEmpty: true,
-			checkResult: func(t *testing.T, revertCalled bool, state map[string]any) {
-				err, ok := state["nested_err"].(error)
-				if !ok {
-					t.Fatalf("expected nested transaction error in state")
-				}
-				expectedMsg := "a transaction is already in progress"
-				if err.Error() != expectedMsg {
-					t.Errorf("unexpected error message: %q, want %q", err.Error(), expectedMsg)
-				}
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cs := &ClusterSnapshot{}
-			revertCalled := false
-			state := make(map[string]any)
-			ctx := t.Context()
-
-			err := cs.Transaction(ctx, klog.FromContext(ctx), func() (TransactionResult, error) {
-				return tc.transactionFn(cs, &revertCalled, state)
-			})
-
-			if (err != nil) != tc.expectErr {
-				t.Errorf("Transaction() error = %v, expectErr %v", err, tc.expectErr)
-			}
-
-			if tc.expectStackEmpty && cs.txCompensations != nil {
-				t.Errorf("Expected txCompensations to be nil, got non-nil")
-			}
-
-			if tc.checkResult != nil {
-				tc.checkResult(t, revertCalled, state)
+			for _, step := range tc.steps {
+				step(t, sc)
 			}
 		})
 	}
@@ -404,23 +515,14 @@ func TestCanSchedulePod(t *testing.T) {
 				CandidateNodeNames: tc.candidateNodes,
 			}
 
-			nodes, diagnosis, err := cs.CanSchedulePod(ctx, klog.FromContext(ctx), pod)
+			nodes, diagnosis, err := cs.CanSchedulePod(ctx, pod)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("CanSchedulePod() error = %v, expectErr %v", err, tc.expectErr)
 			}
 
 			if !tc.expectErr {
-				sort.Strings(nodes)
-				sort.Strings(tc.expectNodes)
-				if len(nodes) != len(tc.expectNodes) {
-					t.Errorf("Expected nodes %v, got %v", tc.expectNodes, nodes)
-				} else {
-					for i, n := range nodes {
-						if n != tc.expectNodes[i] {
-							t.Errorf("Expected nodes %v, got %v", tc.expectNodes, nodes)
-							break
-						}
-					}
+				if diff := cmp.Diff(tc.expectNodes, nodes, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(x, y string) bool { return x < y })); diff != "" {
+					t.Errorf("Unexpected nodes (-want +got):\n%s", diff)
 				}
 
 				if len(tc.expectRejected) > 0 {
@@ -442,96 +544,250 @@ func TestCanSchedulePod(t *testing.T) {
 	}
 }
 
+var scheduleResultCmpOpts = []cmp.Option{
+	cmpopts.EquateEmpty(),
+	cmp.Comparer(func(x, y *fwk.Status) bool {
+		return x.Code() == y.Code()
+	}),
+}
+
 func TestSchedulePods(t *testing.T) {
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "2"}).Obj()
+	node1Unschedulable := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "0"}).Obj()
+	node2Unschedulable := st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "0"}).Obj()
+
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj()
+	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Obj()
+	pod3 := st.MakePod().Name("pod3").Namespace("default").UID("uid-pod3").Obj()
+	pod4 := st.MakePod().Name("pod4").Namespace("default").UID("uid-pod4").Obj()
+
 	tests := []struct {
-		name               string
-		pods               []SchedulablePod
-		opts               SchedulePodsOptions
-		expectResults      int
-		expectErr          bool
-		expectTxLen        int // expected length of txCompensation for current tx
-		inTransaction      bool
-		unschedulableNodes []string
+		name                string
+		nodes               []*v1.Node
+		pods                []SchedulablePod
+		opts                SchedulePodsOptions
+		expectResults       []SchedulingResult
+		expectSnapshotState map[string][]string
+		expectErr           bool
 	}{
 		{
-			name: "Success - schedule one pod",
+			name:  "Success - schedule one pod",
+			nodes: []*v1.Node{node1},
 			pods: []SchedulablePod{
 				{
-					Pod:                st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+					Pod:                pod1,
 					CandidateNodeNames: []string{"node1"},
 				},
 			},
-			opts:          SchedulePodsOptions{},
-			expectResults: 1,
-			expectErr:     false,
+			opts: SchedulePodsOptions{},
+			expectResults: []SchedulingResult{
+				{
+					Pod:              pod1,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+			},
+			expectSnapshotState: map[string][]string{"node1": {"pod1"}},
 		},
 		{
-			name: "DryRun - does not persist",
+			name:  "DryRun - does not persist",
+			nodes: []*v1.Node{node1},
 			pods: []SchedulablePod{
 				{
-					Pod:                st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+					Pod:                pod1,
 					CandidateNodeNames: []string{"node1"},
 				},
 			},
-			opts:          NewSchedulePodsOptions(true, false),
-			expectResults: 1,
-			expectErr:     false,
-		},
-		{
-			name: "InTransaction - adds to compensation",
-			pods: []SchedulablePod{
+			opts: NewSchedulePodsOptions(true, false),
+			expectResults: []SchedulingResult{
 				{
-					Pod:                st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
-					CandidateNodeNames: []string{"node1"},
+					Pod:              pod1,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
 				},
 			},
-			opts:          SchedulePodsOptions{},
-			inTransaction: true,
-			expectResults: 1,
-			expectErr:     false,
-			expectTxLen:   1,
+			expectSnapshotState: map[string][]string{"node1": nil},
 		},
 		{
-			name: "StopOnFailure - fails on first pod",
+			name:  "StopOnFailure - fails on first pod",
+			nodes: nil,
 			pods: []SchedulablePod{
 				{
-					Pod:                st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+					Pod:                pod1,
 					CandidateNodeNames: []string{"non-existent-node"}, // will fail filter or node lookup
 				},
 			},
-			opts:          NewSchedulePodsOptions(false, true),
-			expectResults: 0,
-			expectErr:     true,
+			opts:                NewSchedulePodsOptions(false, true),
+			expectResults:       nil,
+			expectSnapshotState: map[string][]string{},
+			expectErr:           true,
 		},
 		{
-			name: "Fails due to node unschedulable",
+			name:  "Fails due to node unschedulable",
+			nodes: []*v1.Node{node1Unschedulable},
 			pods: []SchedulablePod{
 				{
-					Pod:                st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+					Pod:                pod1,
 					CandidateNodeNames: []string{"node1"},
 				},
 			},
-			opts:               NewSchedulePodsOptions(false, true),
-			expectResults:      0,
-			expectErr:          true,
-			unschedulableNodes: []string{"node1"},
+			opts: NewSchedulePodsOptions(false, true),
+			expectResults: []SchedulingResult{
+				{
+					Pod:              pod1,
+					SelectedNodeName: "",
+					Status:           fwk.NewStatus(fwk.Unschedulable),
+				},
+			},
+			expectSnapshotState: map[string][]string{"node1": nil},
 		},
 		{
-			name: "StopOnFailure - succeeds on first, fails on second due to node unschedulable",
+			name:  "Schedule over capacity without stopping on failure",
+			nodes: []*v1.Node{node1},
+			pods: []SchedulablePod{
+				{Pod: pod1, CandidateNodeNames: []string{"node1"}},
+				{Pod: pod2, CandidateNodeNames: []string{"node1"}},
+				{Pod: pod3, CandidateNodeNames: []string{"node1"}},
+				{Pod: pod4, CandidateNodeNames: []string{"node1"}},
+			},
+			opts: NewSchedulePodsOptions(false, false),
+			expectResults: []SchedulingResult{
+				{
+					Pod:              pod1,
+					Status:           fwk.NewStatus(fwk.Success),
+					SelectedNodeName: "node1",
+				},
+				{
+					Pod:              pod2,
+					Status:           fwk.NewStatus(fwk.Success),
+					SelectedNodeName: "node1",
+				},
+				{
+					Pod:    pod3,
+					Status: fwk.NewStatus(fwk.Unschedulable),
+				},
+				{
+					Pod:    pod4,
+					Status: fwk.NewStatus(fwk.Unschedulable),
+				},
+			},
+			expectSnapshotState: map[string][]string{
+				"node1": {"pod1", "pod2"},
+			},
+		},
+		{
+			name:  "Schedule over capacity with stopping on failure",
+			nodes: []*v1.Node{node1},
+			pods: []SchedulablePod{
+				{Pod: pod1, CandidateNodeNames: []string{"node1"}},
+				{Pod: pod2, CandidateNodeNames: []string{"node1"}},
+				{Pod: pod3, CandidateNodeNames: []string{"node1"}},
+				{Pod: pod4, CandidateNodeNames: []string{"node1"}},
+			},
+			opts: NewSchedulePodsOptions(false, true),
+			expectResults: []SchedulingResult{
+				{
+					Pod:              pod1,
+					Status:           fwk.NewStatus(fwk.Success),
+					SelectedNodeName: "node1",
+				},
+				{
+					Pod:              pod2,
+					Status:           fwk.NewStatus(fwk.Success),
+					SelectedNodeName: "node1",
+				},
+				{
+					Pod:    pod3,
+					Status: fwk.NewStatus(fwk.Unschedulable),
+				},
+			},
+			expectSnapshotState: map[string][]string{
+				"node1": {"pod1", "pod2"},
+			},
+		},
+		{
+			name:  "StopOnFailure - succeeds on first, fails on second due to node unschedulable",
+			nodes: []*v1.Node{node1, node2Unschedulable},
 			pods: []SchedulablePod{
 				{
-					Pod:                st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+					Pod:                pod1,
 					CandidateNodeNames: []string{"node1"},
 				},
 				{
-					Pod:                st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Obj(),
+					Pod:                pod2,
 					CandidateNodeNames: []string{"node2"},
 				},
 			},
-			opts:               NewSchedulePodsOptions(false, true),
-			expectResults:      1,    // Pod 1 succeeds on node1
-			expectErr:          true, // Pod 2 fails on node2
-			unschedulableNodes: []string{"node2"},
+			opts: NewSchedulePodsOptions(false, true),
+			expectResults: []SchedulingResult{
+				{
+					Pod:              pod1,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:              pod2,
+					SelectedNodeName: "",
+					Status:           fwk.NewStatus(fwk.Unschedulable),
+				},
+			},
+			expectSnapshotState: map[string][]string{"node1": {"pod1"}, "node2": nil},
+		},
+		{
+			name:  "StopOnFailure - stops on first failure even if more pods could be scheduled",
+			nodes: []*v1.Node{node1, node2Unschedulable},
+			pods: []SchedulablePod{
+				{
+					Pod:                pod1,
+					CandidateNodeNames: []string{"node1"},
+				},
+				{
+					Pod:                pod2,
+					CandidateNodeNames: []string{"node2"},
+				},
+				{
+					Pod:                pod3,
+					CandidateNodeNames: []string{"node1"},
+				},
+			},
+			opts: NewSchedulePodsOptions(false, true),
+			expectResults: []SchedulingResult{
+				{
+					Pod:              pod1,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:              pod2,
+					SelectedNodeName: "",
+					Status:           fwk.NewStatus(fwk.Unschedulable),
+				},
+			},
+			expectSnapshotState: map[string][]string{"node1": {"pod1"}, "node2": nil},
+		},
+		{
+			name:  "Error outside transaction - rolls back previous successful pods",
+			nodes: []*v1.Node{node1},
+			pods: []SchedulablePod{
+				{
+					Pod:                pod1,
+					CandidateNodeNames: []string{"node1"},
+				},
+				{
+					Pod:                pod2,
+					CandidateNodeNames: []string{"non-existent-node"},
+				},
+			},
+			opts: SchedulePodsOptions{},
+			expectResults: []SchedulingResult{
+				{
+					Pod:              pod1,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+			},
+			expectSnapshotState: map[string][]string{"node1": nil},
+			expectErr:           true,
 		},
 	}
 
@@ -539,112 +795,163 @@ func TestSchedulePods(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 
-			var nodes []*v1.Node
-			nodeMap := make(map[string]*v1.Node)
-			unschedSet := make(map[string]struct{})
-			for _, n := range tc.unschedulableNodes {
-				unschedSet[n] = struct{}{}
-			}
-			for _, pod := range tc.pods {
-				for _, nodeName := range pod.CandidateNodeNames {
-					if nodeName != "non-existent-node" && nodeMap[nodeName] == nil {
-						node := &v1.Node{
-							ObjectMeta: metav1.ObjectMeta{Name: nodeName},
-							Status: v1.NodeStatus{
-								Allocatable: v1.ResourceList{
-									v1.ResourcePods: resource.MustParse("110"),
-								},
-								Capacity: v1.ResourceList{
-									v1.ResourcePods: resource.MustParse("110"),
-								},
-							},
-						}
-						if _, ok := unschedSet[nodeName]; ok {
-							node.Spec.Unschedulable = true
-						}
-						nodeMap[nodeName] = node
-						nodes = append(nodes, node)
-					}
-				}
+			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
+
+			var pods []*SchedulablePod
+			for i := range tc.pods {
+				pods = append(pods, &tc.pods[i])
 			}
 
-			cs, _, _ := setupSnapshotTest(t, ctx, nodes, nil)
-
-			if tc.inTransaction {
-				cs.txCompensations = []*txMutation{}
-			}
-
-			results, err := cs.SchedulePods(ctx, klog.FromContext(ctx), tc.pods, tc.opts)
+			results, err := cs.SchedulePods(ctx, pods, tc.opts)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("SchedulePods() error = %v, expectErr %v", err, tc.expectErr)
 			}
 
-			if len(results) != tc.expectResults {
-				t.Errorf("Expected results %d, got %d", tc.expectResults, len(results))
+			if diff := cmp.Diff(tc.expectResults, results, scheduleResultCmpOpts...); diff != "" {
+				t.Errorf("Unexpected scheduling results (-want +got):\n%s", diff)
 			}
 
-			if tc.inTransaction {
-				txLen := len(cs.txCompensations)
-				if txLen != tc.expectTxLen {
-					t.Errorf("Expected tx compensation len %d, got %d", tc.expectTxLen, txLen)
-				}
-			}
+			ft.VerifySnapshot(t, snap, tc.expectSnapshotState)
 		})
 	}
 }
 
 func TestSchedulePodsByTemplate(t *testing.T) {
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "3"}).Obj()
+
+	defaultTemplate := &v1.PodTemplateSpec{Spec: v1.PodSpec{}}
+	customNSTemplate := &v1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "custom-ns"},
+		Spec:       v1.PodSpec{},
+	}
+
+	generatedPod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "templated-pod", Namespace: "default"}}
+	generatedNSPod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "templated-pod-0-", Namespace: "custom-ns"}}
+
 	tests := []struct {
-		name           string
-		template       *v1.PodTemplateSpec
-		candidateNodes []string
-		maxPods        int
-		opts           SchedulePodsByTemplateOptions
-		expectResults  int
-		expectErr      bool
-		expectTxLen    int
-		inTransaction  bool
+		name                string
+		template            *v1.PodTemplateSpec
+		nodes               []*v1.Node
+		candidateNodes      []string
+		maxPods             int
+		opts                SchedulePodsByTemplateOptions
+		expectResults       []SchedulingResult
+		expectSnapshotState map[string]int
+		expectErr           bool
 	}{
 		{
 			name:           "Success - schedule maxPods",
-			template:       &v1.PodTemplateSpec{Spec: v1.PodSpec{}},
-			candidateNodes: []string{"node1", "node2"},
+			template:       defaultTemplate,
+			nodes:          []*v1.Node{node1},
+			candidateNodes: []string{"node1"},
 			maxPods:        2,
 			opts:           SchedulePodsByTemplateOptions{},
-			expectResults:  2,
-			expectErr:      false,
+			expectResults: []SchedulingResult{
+				{
+					Pod:              generatedPod,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:              generatedPod,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+			},
+			expectSnapshotState: map[string]int{"node1": 2},
+			expectErr:           false,
+		},
+		{
+			name:           "Max pods over candidate capacity",
+			template:       defaultTemplate,
+			nodes:          []*v1.Node{node1},
+			candidateNodes: []string{"node1"},
+			maxPods:        5,
+			opts:           SchedulePodsByTemplateOptions{},
+			expectResults: []SchedulingResult{
+				{
+					Pod:              generatedPod,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:              generatedPod,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:              generatedPod,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:    generatedPod,
+					Status: fwk.NewStatus(fwk.Unschedulable),
+				},
+			},
+			expectSnapshotState: map[string]int{"node1": 3},
+			expectErr:           false,
+		},
+		{
+			name:                "Zero maxPods returns nil",
+			template:            defaultTemplate,
+			nodes:               []*v1.Node{node1},
+			candidateNodes:      []string{"node1"},
+			maxPods:             0,
+			opts:                SchedulePodsByTemplateOptions{},
+			expectResults:       nil,
+			expectSnapshotState: map[string]int{"node1": 0},
+			expectErr:           false,
+		},
+		{
+			name:                "Empty candidateNodes returns nil",
+			template:            defaultTemplate,
+			nodes:               nil,
+			candidateNodes:      []string{},
+			maxPods:             2,
+			opts:                SchedulePodsByTemplateOptions{},
+			expectResults:       nil,
+			expectSnapshotState: map[string]int{},
+			expectErr:           false,
 		},
 		{
 			name:           "DryRun - does not persist",
-			template:       &v1.PodTemplateSpec{Spec: v1.PodSpec{}},
+			template:       defaultTemplate,
+			nodes:          []*v1.Node{node1},
 			candidateNodes: []string{"node1"},
 			maxPods:        2,
 			opts:           NewSchedulePodsByTemplateOptions(true),
-			expectResults:  2,
-			expectErr:      false,
-		},
-		{
-			name:           "InTransaction - adds to compensation",
-			template:       &v1.PodTemplateSpec{Spec: v1.PodSpec{}},
-			candidateNodes: []string{"node1"},
-			maxPods:        1,
-			opts:           SchedulePodsByTemplateOptions{},
-			inTransaction:  true,
-			expectResults:  1,
-			expectErr:      false,
-			expectTxLen:    1,
-		},
-		{
-			name: "Custom Namespace",
-			template: &v1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "custom-ns"},
-				Spec:       v1.PodSpec{},
+			expectResults: []SchedulingResult{
+				{
+					Pod:              generatedPod,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:              generatedPod,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
 			},
+			expectSnapshotState: map[string]int{"node1": 0},
+			expectErr:           false,
+		},
+		{
+			name:           "Custom Namespace",
+			template:       customNSTemplate,
+			nodes:          []*v1.Node{node1},
 			candidateNodes: []string{"node1"},
 			maxPods:        1,
 			opts:           SchedulePodsByTemplateOptions{},
-			expectResults:  1,
-			expectErr:      false,
+			expectResults: []SchedulingResult{
+				{
+					Pod:              generatedNSPod,
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+			},
+			expectSnapshotState: map[string]int{"node1": 1},
+			expectErr:           false,
 		},
 	}
 
@@ -652,42 +959,27 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 
-			var nodes []*v1.Node
-			for _, nodeName := range tc.candidateNodes {
-				nodes = append(nodes, &v1.Node{
-					ObjectMeta: metav1.ObjectMeta{Name: nodeName},
-					Status: v1.NodeStatus{
-						Allocatable: v1.ResourceList{
-							v1.ResourcePods: resource.MustParse("110"),
-						},
-						Capacity: v1.ResourceList{
-							v1.ResourcePods: resource.MustParse("110"),
-						},
-					},
-				})
-			}
+			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			cs, _, _ := setupSnapshotTest(t, ctx, nodes, nil)
-
-			if tc.inTransaction {
-				cs.txCompensations = []*txMutation{}
-			}
-
-			results, err := cs.SchedulePodsByTemplate(ctx, klog.FromContext(ctx), tc.template, tc.candidateNodes, tc.maxPods, tc.opts)
+			results, err := cs.SchedulePodsByTemplate(ctx, tc.template, tc.candidateNodes, tc.maxPods, tc.opts)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("SchedulePodsByTemplate() error = %v, expectErr %v", err, tc.expectErr)
 			}
 
-			if len(results) != tc.expectResults {
-				t.Errorf("Expected results %d, got %d", tc.expectResults, len(results))
+			var opts []cmp.Option
+			opts = append(opts, scheduleResultCmpOpts...)
+			opts = append(opts, cmp.Comparer(func(x, y *v1.Pod) bool {
+				if x == nil || y == nil {
+					return x == y
+				}
+				return x.Namespace == y.Namespace && (strings.HasPrefix(x.Name, y.Name) || strings.HasPrefix(y.Name, x.Name))
+			}))
+
+			if diff := cmp.Diff(tc.expectResults, results, opts...); diff != "" {
+				t.Errorf("Unexpected scheduling results (-want +got):\n%s", diff)
 			}
 
-			if tc.inTransaction {
-				txLen := len(cs.txCompensations)
-				if txLen != tc.expectTxLen {
-					t.Errorf("Expected tx compensation len %d, got %d", tc.expectTxLen, txLen)
-				}
-			}
+			ft.VerifySnapshotPodCounts(t, snap, tc.expectSnapshotState)
 		})
 	}
 }

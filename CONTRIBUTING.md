@@ -32,7 +32,7 @@ Our long-term goal is to migrate this simulation logic into the core Kubernetes 
 
 ### Explicit packaging for borrowed logic
 
-Any logic duplicated from the Kubernetes scheduler (e.g. to export internal code) must be placed in a dedicated package named `/pkg/upstream_sync`. Treat this code as "temporary debt" and include a comment in the code with a link to the upstream PR that will remove this code.
+Any logic duplicated from the Kubernetes scheduler (e.g. to export internal code) must be placed in a dedicated package named `/pkg/upstreamsync`. Treat this code as "temporary debt" and include a comment in the code with a link to the upstream PR that will remove this code.
 
 ### Synchronous upstreaming
 

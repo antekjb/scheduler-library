@@ -17,14 +17,19 @@ package snapshot
 import (
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"testing"
+
+	"context"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
 
 var (
@@ -34,6 +39,10 @@ var (
 		}
 	}
 )
+
+func newSnapshot(pods []*v1.Pod, nodes []*v1.Node) *upstreamsync.MutatingSnapshot {
+	return upstreamsync.NewMutatingSnapshot(cache.NewSnapshot(pods, nodes))
+}
 
 func TestAddPodToNode(t *testing.T) {
 	ctx := t.Context()
@@ -78,7 +87,7 @@ func TestAddPodToNode(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			snapshot := cache.NewSnapshot(nil, tc.nodes)
+			snapshot := newSnapshot(nil, tc.nodes)
 
 			revertFn, err := addPodToNode(ctx, snapshot, tc.pod, tc.targetNode)
 			if (err != nil) != tc.expectErr {
@@ -176,9 +185,11 @@ func TestRemovePodFromNode(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			snapshot := cache.NewSnapshot(tc.initPods, tc.nodes)
+			snapshot := newSnapshot(tc.initPods, tc.nodes)
+			pod = tc.pod.DeepCopy()
+			pod.Spec.NodeName = tc.targetNode
 
-			revertFn, err := removePodFromNode(ctx, snapshot, tc.pod, tc.targetNode)
+			revertFn, err := removePodFromNode(ctx, snapshot, pod)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("unexpected error state: %v, expectErr: %v", err, tc.expectErr)
 			}
@@ -196,8 +207,8 @@ func TestRemovePodFromNode(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if slices.ContainsFunc(nodeInfo.GetPods(), byPodName(tc.pod.Name)) {
-				t.Errorf("expected pod %s to be removed from %s", tc.pod.Name, tc.targetNode)
+			if slices.ContainsFunc(nodeInfo.GetPods(), byPodName(pod.Name)) {
+				t.Errorf("expected pod %s to be removed from %s", pod.Name, tc.targetNode)
 			}
 
 			// Run revert function
@@ -207,8 +218,8 @@ func TestRemovePodFromNode(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if !slices.ContainsFunc(nodeInfo.GetPods(), byPodName(tc.pod.Name)) {
-				t.Errorf("expected pod %s, got %s", tc.pod.Name, nodeInfo.GetPods()[0].GetPod().Name)
+			if !slices.ContainsFunc(nodeInfo.GetPods(), byPodName(pod.Name)) {
+				t.Errorf("expected pod %s, got %s", pod.Name, nodeInfo.GetPods()[0].GetPod().Name)
 			}
 		})
 	}
@@ -437,9 +448,9 @@ func TestScheduleOnePod(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, snap, upstreamSched := setupSnapshotTest(t, ctx, tc.nodes, nil)
+			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			algRes, revertFn, err := scheduleOnePod(ctx, upstreamSched, snap, tc.pod, tc.candidates)
+			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, upstreamsync.NewScheduler(snap, 0, 0, math.MaxInt32), snap, tc.pod, tc.candidates)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("unexpected error state: %v, expectErr: %v", err, tc.expectErr)
 			}
@@ -481,4 +492,12 @@ func TestScheduleOnePod(t *testing.T) {
 			}
 		})
 	}
+}
+
+func setupSnapshotTest(t *testing.T, ctx context.Context, nodes []*v1.Node, pods []*v1.Pod) (*ClusterSnapshot, *cache.Snapshot, *upstreamsync.ProfileMap) {
+	profiles, snap, err := ft.SetupSnapshotTest(ctx, pods, nodes)
+	if err != nil {
+		t.Fatalf("Failed to set up snapshot: %v", err)
+	}
+	return New(snap, profiles), snap, profiles
 }

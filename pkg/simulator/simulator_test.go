@@ -26,37 +26,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
-	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"sigs.k8s.io/scheduler-library/pkg/snapshot"
 )
-
-
-func TestMetricsRegisteredByNewClusterState(t *testing.T) {
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
-		Profiles: []schedulerapi.KubeSchedulerProfile{
-			{
-				SchedulerName: "default-scheduler",
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
-				},
-			},
-		},
-	}
-	ctx := t.Context()
-	client := fake.NewClientset()
-	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	sim, err := NewSchedulingSimulator(ctx, cfg, informerFactory)
-	if err != nil {
-		t.Fatalf("failed to create simulator: %v", err)
-	}
-	if _, err := sim.NewClusterState(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if metrics.CacheSize == nil {
-		t.Error("metrics.CacheSize should be non-nil after NewClusterState — metrics.Register() must be called in production code")
-	}
-}
 
 func TestNewSchedulingSimulator(t *testing.T) {
 	cfg := &schedulerapi.KubeSchedulerConfiguration{
@@ -72,7 +43,7 @@ func TestNewSchedulingSimulator(t *testing.T) {
 	}
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	sim, err := NewSchedulingSimulator(t.Context(), cfg, informerFactory)
+	sim, err := NewSchedulingSimulator(t.Context(), cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
 	if err != nil {
 		t.Fatalf("failed to create simulator: %v", err)
 	}
@@ -93,7 +64,7 @@ func TestNewSchedulingSimulatorWithNilInformerFactory(t *testing.T) {
 			},
 		},
 	}
-	sim, err := NewSchedulingSimulator(t.Context(), cfg, nil)
+	sim, err := NewSchedulingSimulator(t.Context(), cfg, ReadonlyClient{client: fake.NewClientset()}, nil)
 	if err != nil {
 		t.Fatalf("failed to create simulator with nil informerFactory: %v", err)
 	}
@@ -203,7 +174,7 @@ func TestNewClusterState(t *testing.T) {
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 			ctx := t.Context()
 
-			sim, err := NewSchedulingSimulator(ctx, tc.cfg, informerFactory)
+			sim, err := NewSchedulingSimulator(ctx, tc.cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
 			if tc.expectErr {
 				if err != nil {
 					return
@@ -317,7 +288,7 @@ func TestNewClusterSnapshot(t *testing.T) {
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 			ctx := t.Context()
 
-			sim, err := NewSchedulingSimulator(ctx, tc.cfg, informerFactory)
+			sim, err := NewSchedulingSimulator(ctx, tc.cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
 			if tc.expectErr {
 				if err != nil {
 					return
@@ -353,7 +324,7 @@ func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 	}
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	sim, err := NewSchedulingSimulator(ctx, cfg, informerFactory)
+	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
 	if err != nil {
 		t.Fatalf("failed to create simulator: %v", err)
 	}
@@ -385,7 +356,7 @@ func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 		},
 	}
 
-	results, err := snap.SchedulePods(ctx, klog.FromContext(ctx), []snapshot.SchedulablePod{
+	results, err := snap.SchedulePods(ctx, []*snapshot.SchedulablePod{
 		{Pod: pod, CandidateNodeNames: []string{"node1"}},
 	}, snapshot.SchedulePodsOptions{})
 	if err != nil {
@@ -417,7 +388,7 @@ func TestClusterState_Scheduling(t *testing.T) {
 	}
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	sim, err := NewSchedulingSimulator(ctx, cfg, informerFactory)
+	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
 	if err != nil {
 		t.Fatalf("failed to create simulator: %v", err)
 	}
@@ -453,7 +424,7 @@ func TestClusterState_Scheduling(t *testing.T) {
 		},
 	}
 
-	results, err := snap.SchedulePods(ctx, klog.FromContext(ctx), []snapshot.SchedulablePod{
+	results, err := snap.SchedulePods(ctx, []*snapshot.SchedulablePod{
 		{Pod: pod, CandidateNodeNames: []string{"node1"}},
 	}, snapshot.SchedulePodsOptions{})
 	if err != nil {

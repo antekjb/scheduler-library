@@ -18,47 +18,54 @@ import (
 	"context"
 	"fmt"
 
+	"sigs.k8s.io/scheduler-library/pkg/framework"
 	"sigs.k8s.io/scheduler-library/pkg/snapshot"
 	"sigs.k8s.io/scheduler-library/pkg/state"
-	upstreamsync "sigs.k8s.io/scheduler-library/pkg/upstream_sync"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/utils/ptr"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
-	"k8s.io/client-go/tools/events"
-	"k8s.io/klog/v2"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
-	"k8s.io/kubernetes/pkg/scheduler/profile"
 )
 
 type SchedulingSimulator struct {
 	cfg             *schedulerapi.KubeSchedulerConfiguration
-	recorderFactory profile.RecorderFactory
 	informerFactory informers.SharedInformerFactory
+	client          kubernetes.Interface
 }
 
 // NewSchedulingSimulator creates a new SchedulingSimulator.
 func NewSchedulingSimulator(
 	ctx context.Context,
 	cfg *schedulerapi.KubeSchedulerConfiguration,
+	client ReadonlyClient,
 	informerFactory informers.SharedInformerFactory,
 ) (*SchedulingSimulator, error) {
-	recorderFactory := func(name string) events.EventRecorderLogger {
-		return &discardEventRecorder{}
+	if client.client == nil {
+		return nil, fmt.Errorf("client needs to be provided, got nil")
 	}
 
+	framework.InitMetricsOnce()
+
 	if informerFactory == nil {
-		informerFactory = informers.NewSharedInformerFactory(nil, 0)
+		informerFactory = scheduler.NewInformerFactory(client.client, 0)
+	}
+	_ = informerFactory.Core().V1().Nodes().Informer()
+	_ = informerFactory.Core().V1().Pods().Informer()
+	informerFactory.StartWithContext(ctx)
+	res := informerFactory.WaitForCacheSyncWithContext(ctx)
+	if res.Err != nil {
+		return nil, res.Err
 	}
 
 	return &SchedulingSimulator{
 		cfg:             cfg,
-		recorderFactory: recorderFactory,
 		informerFactory: informerFactory,
+		client:          client.client,
 	}, nil
 }
 
@@ -66,49 +73,36 @@ func NewSchedulingSimulator(
 func (s *SchedulingSimulator) NewClusterState(ctx context.Context) (*state.ClusterState, error) {
 	snap := cache.NewEmptySnapshot()
 
-	sched, err := s.buildScheduler(ctx, snap)
+	internalCache := cache.New(ctx, nil, false)
+	profiles, err := s.buildProfileMap(ctx, snap)
 	if err != nil {
 		return nil, err
 	}
 
-	internalCache := cache.New(ctx, nil, false)
-
-	upstreamSched := upstreamsync.NewScheduler(sched, snap)
-	return state.New(internalCache, upstreamSched, snap), nil
+	return state.New(internalCache, profiles, snap), nil
 }
 
 // NewClusterSnapshot initializes a new snapshot with the provided pods and nodes.
 func (s *SchedulingSimulator) NewClusterSnapshot(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*snapshot.ClusterSnapshot, error) {
 	snap := cache.NewSnapshot(pods, nodes)
 
-	sched, err := s.buildScheduler(ctx, snap)
+	profiles, err := s.buildProfileMap(ctx, snap)
 	if err != nil {
 		return nil, err
 	}
 
-	upstreamSched := upstreamsync.NewScheduler(sched, snap)
-	return snapshot.New(snap, upstreamSched), nil
+	return snapshot.New(snap, profiles), nil
 }
 
-func (s *SchedulingSimulator) buildScheduler(ctx context.Context, snap *cache.Snapshot) (*scheduler.Scheduler, error) {
-	sched, err := scheduler.New(ctx, nil, s.informerFactory, nil, s.recorderFactory,
-		scheduler.WithProfiles(s.cfg.Profiles...),
-		scheduler.WithNodeInfoSnapshot(snap),
-		scheduler.WithPercentageOfNodesToScore(ptr.To[int32](100)),
-	)
+func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot) (*upstreamsync.ProfileMap, error) {
+	profiles, err := framework.NewProfileMap(ctx, s.client, s.informerFactory, snap, s.cfg)
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}
-	return sched, nil
-}
-
-type discardEventRecorder struct{}
-
-var _ events.EventRecorderLogger = &discardEventRecorder{}
-
-func (d *discardEventRecorder) Eventf(regarding runtime.Object, related runtime.Object, eventtype, reason, action, note string, args ...interface{}) {
-}
-
-func (d *discardEventRecorder) WithLogger(logger klog.Logger) events.EventRecorderLogger {
-	return d
+	s.informerFactory.StartWithContext(ctx)
+	res := s.informerFactory.WaitForCacheSyncWithContext(ctx)
+	if res.Err != nil {
+		return nil, res.Err
+	}
+	return profiles, nil
 }

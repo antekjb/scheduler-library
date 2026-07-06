@@ -356,9 +356,11 @@ func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 		},
 	}
 
-	results, err := snap.SchedulePods(ctx, []*snapshot.SchedulablePod{
-		{Pod: pod, CandidateNodeNames: []string{"node1"}},
-	}, snapshot.SchedulePodsOptions{})
+	placement, err := snap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+	results, err := snap.SchedulePods(ctx, []*v1.Pod{pod}, placement, snapshot.SchedulePodsOptions{})
 	if err != nil {
 		t.Fatalf("SchedulePods failed: %v", err)
 	}
@@ -424,9 +426,11 @@ func TestClusterState_Scheduling(t *testing.T) {
 		},
 	}
 
-	results, err := snap.SchedulePods(ctx, []*snapshot.SchedulablePod{
-		{Pod: pod, CandidateNodeNames: []string{"node1"}},
-	}, snapshot.SchedulePodsOptions{})
+	placement, err := snap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+	results, err := snap.SchedulePods(ctx, []*v1.Pod{pod}, placement, snapshot.SchedulePodsOptions{})
 	if err != nil {
 		t.Fatalf("SchedulePods failed: %v", err)
 	}

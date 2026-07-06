@@ -105,18 +105,19 @@ func unpreemptErr(handleKey string, wantErr string) stepFn {
 func schedule(podNames []string, candidateNodes []string, opts SchedulePodsOptions) stepFn {
 	return func(t *testing.T, sc *stepContext) {
 		t.Helper()
-		var schedPods []*SchedulablePod
+		var pods []*v1.Pod
 		for _, name := range podNames {
 			p, ok := sc.pods[name]
 			if !ok {
 				t.Fatalf("schedule: pod %q not found in stepContext", name)
 			}
-			schedPods = append(schedPods, &SchedulablePod{
-				Pod:                p,
-				CandidateNodeNames: candidateNodes,
-			})
+			pods = append(pods, p)
 		}
-		_, err := sc.cs.SchedulePods(sc.ctx, schedPods, opts)
+		placement, err := sc.cs.MakePlacement(candidateNodes)
+		if err != nil {
+			t.Fatalf("schedule: MakePlacement failed: %v", err)
+		}
+		_, err = sc.cs.SchedulePods(sc.ctx, pods, placement, opts)
 		if err != nil {
 			t.Fatalf("SchedulePods(%v) unexpected error: %v", podNames, err)
 		}
@@ -130,8 +131,11 @@ func canSchedule(podName string, candidateNodes []string) stepFn {
 		if !ok {
 			t.Fatalf("canSchedule: pod %q not found in stepContext", podName)
 		}
-		sp := SchedulablePod{Pod: p, CandidateNodeNames: candidateNodes}
-		_, _, err := sc.cs.CanSchedulePod(sc.ctx, sp)
+		placement, err := sc.cs.MakePlacement(candidateNodes)
+		if err != nil {
+			t.Fatalf("canSchedule: MakePlacement failed: %v", err)
+		}
+		_, _, err = sc.cs.CanSchedulePod(sc.ctx, p, placement)
 		if err != nil {
 			t.Fatalf("CanSchedulePod(%q) unexpected error: %v", podName, err)
 		}
@@ -449,6 +453,26 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 	}
 }
 
+func TestMakePlacement(t *testing.T) {
+	node1 := st.MakeNode().Name("node1").Obj()
+	node2 := st.MakeNode().Name("node2").Obj()
+
+	cs, _, _ := setupSnapshotTest(t, context.Background(), []*v1.Node{node1, node2}, nil)
+
+	placement, err := cs.MakePlacement([]string{"node1", "node2"})
+	if err != nil {
+		t.Fatalf("unexpected error from MakePlacement: %v", err)
+	}
+	if placement == nil || len(placement.Nodes) != 2 {
+		t.Fatalf("expected placement with 2 nodes, got %v", placement)
+	}
+
+	_, err = cs.MakePlacement([]string{"node1", "non-existent-node"})
+	if err == nil {
+		t.Fatalf("expected error when node not found in snapshot, got nil")
+	}
+}
+
 func TestCanSchedulePod(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -510,12 +534,14 @@ func TestCanSchedulePod(t *testing.T) {
 					v1.ResourceCPU: tc.podRequestCPU,
 				})
 			}
-			pod := SchedulablePod{
-				Pod:                podBuilder.Obj(),
-				CandidateNodeNames: tc.candidateNodes,
+			pod := podBuilder.Obj()
+
+			placement, err := cs.MakePlacement(tc.candidateNodes)
+			if err != nil && !tc.expectErr {
+				t.Fatalf("MakePlacement() error = %v", err)
 			}
 
-			nodes, diagnosis, err := cs.CanSchedulePod(ctx, pod)
+			nodes, diagnosis, err := cs.CanSchedulePod(ctx, pod, placement)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("CanSchedulePod() error = %v, expectErr %v", err, tc.expectErr)
 			}
@@ -553,33 +579,33 @@ var scheduleResultCmpOpts = []cmp.Option{
 
 func TestSchedulePods(t *testing.T) {
 	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "2"}).Obj()
+	node1Capacity1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "1"}).Obj()
 	node1Unschedulable := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "0"}).Obj()
 	node2Unschedulable := st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "0"}).Obj()
 
 	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj()
+	pod1WithErr := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").SchedulerName("non-existent-scheduler").Obj()
 	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Obj()
+	pod2WithErr := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").SchedulerName("non-existent-scheduler").Obj()
 	pod3 := st.MakePod().Name("pod3").Namespace("default").UID("uid-pod3").Obj()
 	pod4 := st.MakePod().Name("pod4").Namespace("default").UID("uid-pod4").Obj()
 
 	tests := []struct {
 		name                string
 		nodes               []*v1.Node
-		pods                []SchedulablePod
+		pods                []*v1.Pod
+		candidateNodes      []string
 		opts                SchedulePodsOptions
 		expectResults       []SchedulingResult
 		expectSnapshotState map[string][]string
 		expectErr           bool
 	}{
 		{
-			name:  "Success - schedule one pod",
-			nodes: []*v1.Node{node1},
-			pods: []SchedulablePod{
-				{
-					Pod:                pod1,
-					CandidateNodeNames: []string{"node1"},
-				},
-			},
-			opts: SchedulePodsOptions{},
+			name:           "Success - schedule one pod",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{pod1},
+			candidateNodes: []string{"node1"},
+			opts:           SchedulePodsOptions{},
 			expectResults: []SchedulingResult{
 				{
 					Pod:              pod1,
@@ -590,15 +616,11 @@ func TestSchedulePods(t *testing.T) {
 			expectSnapshotState: map[string][]string{"node1": {"pod1"}},
 		},
 		{
-			name:  "DryRun - does not persist",
-			nodes: []*v1.Node{node1},
-			pods: []SchedulablePod{
-				{
-					Pod:                pod1,
-					CandidateNodeNames: []string{"node1"},
-				},
-			},
-			opts: NewSchedulePodsOptions(true, false),
+			name:           "DryRun - does not persist",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{pod1},
+			candidateNodes: []string{"node1"},
+			opts:           NewSchedulePodsOptions(true, false),
 			expectResults: []SchedulingResult{
 				{
 					Pod:              pod1,
@@ -609,29 +631,21 @@ func TestSchedulePods(t *testing.T) {
 			expectSnapshotState: map[string][]string{"node1": nil},
 		},
 		{
-			name:  "StopOnFailure - fails on first pod",
-			nodes: nil,
-			pods: []SchedulablePod{
-				{
-					Pod:                pod1,
-					CandidateNodeNames: []string{"non-existent-node"}, // will fail filter or node lookup
-				},
-			},
+			name:                "StopOnFailure - fails on first pod",
+			nodes:               []*v1.Node{node1},
+			pods:                []*v1.Pod{pod1WithErr},
+			candidateNodes:      []string{"node1"},
 			opts:                NewSchedulePodsOptions(false, true),
 			expectResults:       nil,
-			expectSnapshotState: map[string][]string{},
+			expectSnapshotState: map[string][]string{"node1": nil},
 			expectErr:           true,
 		},
 		{
-			name:  "Fails due to node unschedulable",
-			nodes: []*v1.Node{node1Unschedulable},
-			pods: []SchedulablePod{
-				{
-					Pod:                pod1,
-					CandidateNodeNames: []string{"node1"},
-				},
-			},
-			opts: NewSchedulePodsOptions(false, true),
+			name:           "Fails due to node unschedulable",
+			nodes:          []*v1.Node{node1Unschedulable},
+			pods:           []*v1.Pod{pod1},
+			candidateNodes: []string{"node1"},
+			opts:           NewSchedulePodsOptions(false, true),
 			expectResults: []SchedulingResult{
 				{
 					Pod:              pod1,
@@ -642,15 +656,11 @@ func TestSchedulePods(t *testing.T) {
 			expectSnapshotState: map[string][]string{"node1": nil},
 		},
 		{
-			name:  "Schedule over capacity without stopping on failure",
-			nodes: []*v1.Node{node1},
-			pods: []SchedulablePod{
-				{Pod: pod1, CandidateNodeNames: []string{"node1"}},
-				{Pod: pod2, CandidateNodeNames: []string{"node1"}},
-				{Pod: pod3, CandidateNodeNames: []string{"node1"}},
-				{Pod: pod4, CandidateNodeNames: []string{"node1"}},
-			},
-			opts: NewSchedulePodsOptions(false, false),
+			name:           "Schedule over capacity without stopping on failure",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{pod1, pod2, pod3, pod4},
+			candidateNodes: []string{"node1"},
+			opts:           NewSchedulePodsOptions(false, false),
 			expectResults: []SchedulingResult{
 				{
 					Pod:              pod1,
@@ -676,15 +686,11 @@ func TestSchedulePods(t *testing.T) {
 			},
 		},
 		{
-			name:  "Schedule over capacity with stopping on failure",
-			nodes: []*v1.Node{node1},
-			pods: []SchedulablePod{
-				{Pod: pod1, CandidateNodeNames: []string{"node1"}},
-				{Pod: pod2, CandidateNodeNames: []string{"node1"}},
-				{Pod: pod3, CandidateNodeNames: []string{"node1"}},
-				{Pod: pod4, CandidateNodeNames: []string{"node1"}},
-			},
-			opts: NewSchedulePodsOptions(false, true),
+			name:           "Schedule over capacity with stopping on failure",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{pod1, pod2, pod3, pod4},
+			candidateNodes: []string{"node1"},
+			opts:           NewSchedulePodsOptions(false, true),
 			expectResults: []SchedulingResult{
 				{
 					Pod:              pod1,
@@ -706,19 +712,11 @@ func TestSchedulePods(t *testing.T) {
 			},
 		},
 		{
-			name:  "StopOnFailure - succeeds on first, fails on second due to node unschedulable",
-			nodes: []*v1.Node{node1, node2Unschedulable},
-			pods: []SchedulablePod{
-				{
-					Pod:                pod1,
-					CandidateNodeNames: []string{"node1"},
-				},
-				{
-					Pod:                pod2,
-					CandidateNodeNames: []string{"node2"},
-				},
-			},
-			opts: NewSchedulePodsOptions(false, true),
+			name:           "StopOnFailure - succeeds on first, fails on second due to node unschedulable",
+			nodes:          []*v1.Node{node1Capacity1, node2Unschedulable},
+			pods:           []*v1.Pod{pod1, pod2},
+			candidateNodes: []string{"node1", "node2"},
+			opts:           NewSchedulePodsOptions(false, true),
 			expectResults: []SchedulingResult{
 				{
 					Pod:              pod1,
@@ -734,23 +732,11 @@ func TestSchedulePods(t *testing.T) {
 			expectSnapshotState: map[string][]string{"node1": {"pod1"}, "node2": nil},
 		},
 		{
-			name:  "StopOnFailure - stops on first failure even if more pods could be scheduled",
-			nodes: []*v1.Node{node1, node2Unschedulable},
-			pods: []SchedulablePod{
-				{
-					Pod:                pod1,
-					CandidateNodeNames: []string{"node1"},
-				},
-				{
-					Pod:                pod2,
-					CandidateNodeNames: []string{"node2"},
-				},
-				{
-					Pod:                pod3,
-					CandidateNodeNames: []string{"node1"},
-				},
-			},
-			opts: NewSchedulePodsOptions(false, true),
+			name:           "StopOnFailure - stops on first failure even if more pods could be scheduled",
+			nodes:          []*v1.Node{node1Capacity1, node2Unschedulable},
+			pods:           []*v1.Pod{pod1, pod2, pod3},
+			candidateNodes: []string{"node1", "node2"},
+			opts:           NewSchedulePodsOptions(false, true),
 			expectResults: []SchedulingResult{
 				{
 					Pod:              pod1,
@@ -766,19 +752,11 @@ func TestSchedulePods(t *testing.T) {
 			expectSnapshotState: map[string][]string{"node1": {"pod1"}, "node2": nil},
 		},
 		{
-			name:  "Error outside transaction - rolls back previous successful pods",
-			nodes: []*v1.Node{node1},
-			pods: []SchedulablePod{
-				{
-					Pod:                pod1,
-					CandidateNodeNames: []string{"node1"},
-				},
-				{
-					Pod:                pod2,
-					CandidateNodeNames: []string{"non-existent-node"},
-				},
-			},
-			opts: SchedulePodsOptions{},
+			name:           "Error outside transaction - rolls back previous successful pods",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{pod1, pod2WithErr},
+			candidateNodes: []string{"node1"},
+			opts:           SchedulePodsOptions{},
 			expectResults: []SchedulingResult{
 				{
 					Pod:              pod1,
@@ -797,12 +775,12 @@ func TestSchedulePods(t *testing.T) {
 
 			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			var pods []*SchedulablePod
-			for i := range tc.pods {
-				pods = append(pods, &tc.pods[i])
+			placement, err := cs.MakePlacement(tc.candidateNodes)
+			if err != nil && !tc.expectErr {
+				t.Fatalf("MakePlacement() error = %v, expectErr %v", err, tc.expectErr)
 			}
 
-			results, err := cs.SchedulePods(ctx, pods, tc.opts)
+			results, err := cs.SchedulePods(ctx, tc.pods, placement, tc.opts)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("SchedulePods() error = %v, expectErr %v", err, tc.expectErr)
 			}
@@ -961,7 +939,12 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 
 			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			results, err := cs.SchedulePodsByTemplate(ctx, tc.template, tc.candidateNodes, tc.maxPods, tc.opts)
+			placement, err := cs.MakePlacement(tc.candidateNodes)
+			if err != nil && !tc.expectErr {
+				t.Fatalf("MakePlacement() error = %v, expectErr %v", err, tc.expectErr)
+			}
+
+			results, err := cs.SchedulePodsByTemplate(ctx, tc.template, placement, tc.maxPods, tc.opts)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("SchedulePodsByTemplate() error = %v, expectErr %v", err, tc.expectErr)
 			}

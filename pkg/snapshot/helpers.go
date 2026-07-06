@@ -23,9 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
-	"k8s.io/kube-scheduler/framework"
-	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
-	fwk "k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
 
@@ -33,7 +31,7 @@ import (
 func addPodToNode(ctx context.Context, schedulerSnapshot *upstreamsync.MutatingSnapshot, pod *v1.Pod, nodeName string) (func(), error) {
 	clonedPod := pod.DeepCopy()
 	clonedPod.Spec.NodeName = nodeName
-	podInfo, err := fwk.NewPodInfo(clonedPod)
+	podInfo, err := framework.NewPodInfo(clonedPod)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pod info: %w", err)
 	}
@@ -54,7 +52,7 @@ func addPodToNode(ctx context.Context, schedulerSnapshot *upstreamsync.MutatingS
 
 // removePodFromNode removes a pod from a specific node and returns the corresponding revert function.
 func removePodFromNode(ctx context.Context, schedulerSnapshot *upstreamsync.MutatingSnapshot, pod *v1.Pod) (func(), error) {
-	podInfo, err := fwk.NewPodInfo(pod.DeepCopy())
+	podInfo, err := framework.NewPodInfo(pod.DeepCopy())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pod info: %w", err)
 	}
@@ -97,47 +95,25 @@ func createPodFromTemplate(template *v1.PodTemplateSpec, index int) *v1.Pod {
 	}
 }
 
-func withPlacement(candidates []string, nodeInfoSnapshot *cache.Snapshot, fn func() error) error {
-	nodes := make([]framework.NodeInfo, 0, len(candidates))
-	for _, name := range candidates {
-		ni, err := nodeInfoSnapshot.NodeInfos().Get(name)
-		if err != nil {
-			return fmt.Errorf("node %s not in snapshot: %w", name, err)
-		}
-		nodes = append(nodes, ni)
-	}
-	if err := nodeInfoSnapshot.AssumePlacement(&framework.Placement{Nodes: nodes}); err != nil {
-		return err
-	}
-	defer nodeInfoSnapshot.ForgetPlacement()
-	return fn()
-}
-
-// ScheduleOnePod simulates a single scheduling cycle for a pod against the given candidate nodes.
-func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, sched *upstreamsync.Scheduler, nodeInfoSnapshot *cache.Snapshot, pod *v1.Pod, candidateNodes []string) (*upstreamsync.AlgorithmResult, func(), error) {
-	framework, err := profiles.FrameworkForPod(pod)
+// scheduleOnePod simulates a single scheduling cycle for a pod against the assumed placement.
+func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, sched *upstreamsync.Scheduler, pod *v1.Pod) (*upstreamsync.AlgorithmResult, func(), error) {
+	schedFramework, err := profiles.FrameworkForPod(pod)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get framework for pod %s: %w", klog.KObj(pod), err)
 	}
 
-	cycleState := fwk.NewCycleState()
-	cycleState.SetPodGroupSchedulingCycle(fwk.NewCycleState())
-	podInfo, err := fwk.NewPodInfo(pod)
+	cycleState := framework.NewCycleState()
+	cycleState.SetPodGroupSchedulingCycle(framework.NewCycleState())
+	podInfo, err := framework.NewPodInfo(pod)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create pod info for pod %s: %w", klog.KObj(pod), err)
 	}
 
-	var algRes upstreamsync.AlgorithmResult
-	var revertFn func()
-
-	err = withPlacement(candidateNodes, nodeInfoSnapshot, func() error {
-		pendingPod := &upstreamsync.PendingPod{
-			PodInfo:    podInfo,
-			CycleState: cycleState,
-		}
-		algRes, revertFn = sched.SchedulePod(ctx, framework, pendingPod)
-		return nil
-	})
+	pendingPod := &upstreamsync.PendingPod{
+		PodInfo:    podInfo,
+		CycleState: cycleState,
+	}
+	algRes, revertFn := sched.SchedulePod(ctx, schedFramework, pendingPod)
 
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to simulate scheduling for pod %s: %w", klog.KObj(pod), err)

@@ -114,10 +114,12 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 		v1.ResourceCPU: "4",
 	}).Obj()
 
-	feasibleNodes, diag, err := snap.CanSchedulePod(ctx, snapshot.SchedulablePod{
-		Pod:                simPod,
-		CandidateNodeNames: []string{"node1"},
-	})
+	placement, err := snap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+
+	feasibleNodes, diag, err := snap.CanSchedulePod(ctx, simPod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed: %v", err)
 	}
@@ -126,9 +128,7 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 	}
 
 	// Schedule the pod on the snapshot
-	results, err := snap.SchedulePods(ctx, []*snapshot.SchedulablePod{
-		{Pod: simPod, CandidateNodeNames: []string{"node1"}},
-	}, snapshot.SchedulePodsOptions{})
+	results, err := snap.SchedulePods(ctx, []*v1.Pod{simPod}, placement, snapshot.SchedulePodsOptions{})
 	if err != nil {
 		t.Fatalf("SchedulePods failed: %v", err)
 	}
@@ -144,10 +144,7 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 		v1.ResourceCPU: "6",
 	}).Obj()
 
-	feasibleNodes, _, err = snap.CanSchedulePod(ctx, snapshot.SchedulablePod{
-		Pod:                hugePod,
-		CandidateNodeNames: []string{"node1"},
-	})
+	feasibleNodes, _, err = snap.CanSchedulePod(ctx, hugePod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
 	}

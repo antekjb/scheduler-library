@@ -19,12 +19,6 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 )
 
-type SchedulablePod struct {
-	Pod *v1.Pod
-	// CandidateNodeNames specifies the nodes which are candidates for the pod to be scheduled on.
-	CandidateNodeNames []string
-}
-
 // CommonSchedulingOptions contains options shared across different scheduling simulation methods.
 type CommonSchedulingOptions struct {
 	// DryRun determines if the scheduling attempt should be a dry run.

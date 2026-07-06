@@ -15,8 +15,6 @@
 package snapshot
 
 import (
-	"errors"
-	"fmt"
 	"math"
 	"slices"
 	"testing"
@@ -297,106 +295,6 @@ func TestCreatePodFromTemplate(t *testing.T) {
 	}
 }
 
-func TestWithPlacement(t *testing.T) {
-	nodeName1 := "node1"
-	nodeName2 := "node2"
-	nodeName3 := "node3"
-	nodes := []*v1.Node{
-		{ObjectMeta: metav1.ObjectMeta{Name: nodeName1}},
-		{ObjectMeta: metav1.ObjectMeta{Name: nodeName2}},
-		{ObjectMeta: metav1.ObjectMeta{Name: nodeName3}},
-	}
-
-	tests := []struct {
-		name          string
-		snapshotNodes []*v1.Node
-		candidates    []string
-		innerFn       func(snapshot *cache.Snapshot) error
-		expectCalled  bool
-		expectedErr   error
-		verifyAfter   func(t *testing.T, snapshot *cache.Snapshot)
-	}{
-		{
-			name:          "success - candidates assumed and forgotten",
-			snapshotNodes: nodes,
-			candidates:    []string{nodeName1, nodeName2},
-			innerFn: func(snapshot *cache.Snapshot) error {
-				if count := snapshot.NumNodesInPlacement(); count != 2 {
-					return fmt.Errorf("expected 2 nodes under placement, got %d", count)
-				}
-				if _, err := snapshot.GetNodeInPlacement(nodeName1); err != nil {
-					return fmt.Errorf("expected node1 to be found under placement: %w", err)
-				}
-				if _, err := snapshot.GetNodeInPlacement(nodeName2); err != nil {
-					return fmt.Errorf("expected node2 to be found under placement: %w", err)
-				}
-				if _, err := snapshot.GetNodeInPlacement(nodeName3); err == nil {
-					return fmt.Errorf("expected node3 to NOT be found under placement, but it was found")
-				}
-				return nil
-			},
-			expectCalled: true,
-			verifyAfter: func(t *testing.T, snapshot *cache.Snapshot) {
-				if count := snapshot.NumNodesInPlacement(); count != 3 {
-					t.Errorf("expected 3 nodes after placement is forgotten, got %d", count)
-				}
-				if _, err := snapshot.GetNodeInPlacement(nodeName3); err != nil {
-					t.Errorf("expected node3 to be found after placement is forgotten: %v", err)
-				}
-			},
-		},
-		{
-			name:          "node not in snapshot",
-			snapshotNodes: nodes[:1],
-			candidates:    []string{nodeName1, nodeName2},
-			innerFn: func(snapshot *cache.Snapshot) error {
-				return nil
-			},
-			expectCalled: false,
-			expectedErr:  errors.New("node node2 not in snapshot: nodeinfo not found for node name \"node2\""),
-		},
-		{
-			name:          "propagate inner function error",
-			snapshotNodes: nodes,
-			candidates:    []string{nodeName1},
-			innerFn: func(snapshot *cache.Snapshot) error {
-				return errors.New("inner error")
-			},
-			expectCalled: true,
-			expectedErr:  errors.New("inner error"),
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			snapshot := cache.NewSnapshot(nil, tc.snapshotNodes)
-			called := false
-			err := withPlacement(tc.candidates, snapshot, func() error {
-				called = true
-				return tc.innerFn(snapshot)
-			})
-			if tc.expectedErr != nil {
-				if err == nil {
-					t.Fatalf("expected error %v, got nil", tc.expectedErr)
-				}
-				if err.Error() != tc.expectedErr.Error() {
-					t.Fatalf("expected error %v, got %v", tc.expectedErr, err)
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-			}
-			if called != tc.expectCalled {
-				t.Errorf("expected inner function called = %v, got %v", tc.expectCalled, called)
-			}
-			if tc.verifyAfter != nil {
-				tc.verifyAfter(t, snapshot)
-			}
-		})
-	}
-}
-
 func TestScheduleOnePod(t *testing.T) {
 	ctx := t.Context()
 
@@ -450,7 +348,16 @@ func TestScheduleOnePod(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, upstreamsync.NewScheduler(snap, 0, 0, math.MaxInt32), snap, tc.pod, tc.candidates)
+			placement, err := cs.MakePlacement(tc.candidates)
+			if err != nil {
+				t.Fatalf("MakePlacement failed: %v", err)
+			}
+			if err := snap.AssumePlacement(placement); err != nil {
+				t.Fatalf("AssumePlacement failed: %v", err)
+			}
+			defer snap.ForgetPlacement()
+
+			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, upstreamsync.NewScheduler(snap, 0, 0, math.MaxInt32), tc.pod)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("unexpected error state: %v, expectErr: %v", err, tc.expectErr)
 			}

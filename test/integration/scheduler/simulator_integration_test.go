@@ -25,7 +25,7 @@ import (
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
 	"sigs.k8s.io/scheduler-library/pkg/simulator"
-	"sigs.k8s.io/scheduler-library/pkg/snapshot"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
 func TestSimulatorIntegrationFlow(t *testing.T) {

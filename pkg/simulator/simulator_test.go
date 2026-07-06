@@ -26,7 +26,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
-	"sigs.k8s.io/scheduler-library/pkg/snapshot"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
 func TestNewSchedulingSimulator(t *testing.T) {

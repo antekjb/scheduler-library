@@ -24,7 +24,11 @@ build:
 
 .PHONY: test
 test:
-	$(GO_CMD) test -v -race ./...
+	$(GO_CMD) test -v -race $$($(GO_CMD) list ./... | grep -vE '^sigs\.k8s\.io/.*/test/integration(/.*)?$$')
+
+.PHONY: test-integration
+test-integration:
+	$(GO_CMD) test -v -race ./test/integration/...
 
 .PHONY: fmt
 fmt:

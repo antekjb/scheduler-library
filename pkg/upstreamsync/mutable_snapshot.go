@@ -35,8 +35,14 @@ We will want to expose AddPod/RemovePod for pods that were originally in the sna
 
 Both cases can be unified under the same Add/Remove operations.
 
+UPSTREAM-DIFF: the whole file is library-only. It has no counterpart in kube-scheduler yet; it
+lives here because it is proposed for the upstream snapshot, not because it was copied from it.
+
 */
 
+// MutatingSnapshot wraps a cache.Snapshot with Add/RemovePod operations that keep track of what
+// was changed, so that the snapshot can be restored to the state it had when the wrapper was
+// created (see RestoreState).
 type MutatingSnapshot struct {
 	*cache.Snapshot
 	addedPods   map[string]func()

@@ -35,19 +35,41 @@ import (
 // same underlying cache.Snapshot. Creating a new snapshot via ClusterState.Snapshot
 // updates that shared snapshot in-place, which invalidates any previously returned
 // ClusterSnapshot instance — callers must not use a prior snapshot after requesting a new one.
+// A ClusterSnapshot is not safe for concurrent use.
 type ClusterSnapshot struct {
-	profiles                  *upstreamsync.ProfileMap
-	schedulerSnapshot         *cache.Snapshot
-	undoLog                   undoLog
-	transactionInProgress     bool
+	// profiles holds the scheduling framework per scheduler name. All of them share
+	// schedulerSnapshot as their SnapshotSharedLister, so the plugins always see the mutations
+	// performed here.
+	profiles *upstreamsync.ProfileMap
+	// schedulerSnapshot is the upstream snapshot holding the actual node and pod data.
+	schedulerSnapshot *cache.Snapshot
+	// undoLog records how to undo every mutation applied to schedulerSnapshot, so that a dry run
+	// or a reverted transaction can restore the state it started from.
+	undoLog undoLog
+	// transactionInProgress guards against nested transactions and tells the mutating methods to
+	// leave the undo log alone, as the enclosing transaction owns it.
+	transactionInProgress bool
+	// stateVersionForPreemption is bumped whenever a mutation makes the outstanding Unpreemption
+	// handles unusable, i.e. whenever the state they would be restoring into is no longer the one
+	// they were taken from. Unpreempt compares it with the value recorded in the handle.
 	stateVersionForPreemption uint64
 }
 
+// undoLog is a stack of the operations reverting the mutations applied to the snapshot, most
+// recent last. Every mutation pushes its revert function, and rolling back means popping and
+// running them until the recorded state version is reached again.
 type undoLog struct {
+	// undoOperations are the revert functions, in the order their mutations were applied.
 	undoOperations []func()
-	stateVersion   uint64
+	// stateVersion is incremented by every registered operation and decremented by every undone
+	// one. A caller records it before mutating and passes it to restoreState afterwards to undo
+	// exactly its own mutations.
+	stateVersion uint64
 }
 
+// registerOperation pushes the revert function of a mutation that has just been applied.
+// A nil undoOperation is ignored, so that callers can pass the result of an operation that
+// did not change anything.
 func (ul *undoLog) registerOperation(undoOperation func()) {
 	if undoOperation != nil {
 		ul.undoOperations = append(ul.undoOperations, undoOperation)
@@ -55,12 +77,15 @@ func (ul *undoLog) registerOperation(undoOperation func()) {
 	}
 }
 
+// restoreState undoes the operations registered after the given state version was observed,
+// in the reverse order of their registration.
 func (ul *undoLog) restoreState(stateVersion uint64) {
 	for ul.stateVersion != stateVersion {
 		ul.undo()
 	}
 }
 
+// undo pops the most recently registered operation and runs it.
 func (ul *undoLog) undo() {
 	ops := ul.undoOperations
 	ops, undoOp := ops[:len(ops)-1], ops[len(ops)-1]
@@ -69,11 +94,19 @@ func (ul *undoLog) undo() {
 	ul.stateVersion--
 }
 
+// commit makes the mutations applied so far permanent by dropping the recorded revert functions.
+// The state version keeps growing across commits, as it is only ever compared against the markers
+// taken after the last commit; it is not an index into undoOperations.
 func (ul *undoLog) commit() {
 	ul.undoOperations = nil
 }
 
 // New creates a new ClusterSnapshot stub wrapping the provided scheduler snapshot and frameworks.
+//
+// Consumers should obtain a ClusterSnapshot from simulator.SchedulingSimulator instead, either via
+// NewClusterSnapshot or via NewClusterState followed by state.ClusterState.Snapshot: those build
+// the full plugin chain out of the KubeSchedulerConfiguration and initialize the scheduler metrics,
+// which this constructor expects to have been done already.
 func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap) *ClusterSnapshot {
 	return &ClusterSnapshot{
 		profiles:          profiles,
@@ -167,6 +200,8 @@ func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
 // StopOnFailure controls whether the first unschedulable pod stops the loop. Note that
 // All unexpected execution errors always propagate immediately regardless of StopOnFailure, as they
 // indicate a programming error rather than a scheduling failure.
+// Every pod that is scheduled gets its Spec.NodeName set to the selected node, which is also
+// reported by the corresponding SchedulingResult.
 func (s *ClusterSnapshot) SchedulePods(ctx context.Context, pods []*v1.Pod, placement *fwk.Placement, opts SchedulePodsOptions) ([]SchedulingResult, error) {
 	return s.schedulePods(ctx, slices.Values(pods), placement, opts)
 }

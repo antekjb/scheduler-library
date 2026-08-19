@@ -96,6 +96,9 @@ func createPodFromTemplate(template *v1.PodTemplateSpec, index int) *v1.Pod {
 }
 
 // scheduleOnePod simulates a single scheduling cycle for a pod against the assumed placement.
+// On success it returns the revert function undoing the changes the cycle made to the snapshot;
+// on a scheduling failure the returned function is nil and the reason is carried by the result's
+// Status.
 func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, sched *upstreamsync.Scheduler, pod *v1.Pod) (*upstreamsync.AlgorithmResult, func(), error) {
 	schedFramework, err := profiles.FrameworkForPod(pod)
 	if err != nil {

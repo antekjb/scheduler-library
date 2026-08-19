@@ -34,6 +34,16 @@ Our long-term goal is to migrate this simulation logic into the core Kubernetes 
 
 Any logic duplicated from the Kubernetes scheduler (e.g. to export internal code) must be placed in a dedicated package named `/pkg/upstreamsync`. Treat this code as "temporary debt" and include a comment in the code with a link to the upstream PR that will remove this code.
 
+### Marking divergences from upstream
+
+Copied code must keep the upstream doc comments verbatim, so that a copy can be diffed against its origin without guessing which comments were rewritten.
+
+Every intentional deviation from upstream must be called out with a comment starting with the `UPSTREAM-DIFF:` prefix, stating what changed and why. Put it on the declaration when the whole function differs, or on the specific line otherwise. Listing everything that has to be reconciled before upstreaming is then a single command:
+
+```sh
+grep -rn "UPSTREAM-DIFF:" pkg/
+```
+
 ### Synchronous upstreaming
 
 We discourage an “eventually” mindset. Any change to core scheduling logic in this library should trigger a parallel contribution to the upstream Kubernetes scheduler.

@@ -32,6 +32,10 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 )
 
+// SchedulingSimulator is the entry point of the library: it owns the scheduler configuration and
+// the informers, and creates the objects the simulation is run against (see NewClusterState and
+// NewClusterSnapshot). It is meant to be created once and reused; every state and snapshot it
+// creates gets its own scheduling profiles built from the same configuration.
 type SchedulingSimulator struct {
 	cfg             *schedulerapi.KubeSchedulerConfiguration
 	informerFactory informers.SharedInformerFactory
@@ -39,6 +43,9 @@ type SchedulingSimulator struct {
 }
 
 // NewSchedulingSimulator creates a new SchedulingSimulator.
+// The cfg may be nil, in which case the default kube-scheduler profile is used, and so may the
+// informerFactory, in which case one is created from the client. The informers are started and
+// synced before returning, so the call blocks until the cluster state has been read.
 func NewSchedulingSimulator(
 	ctx context.Context,
 	cfg *schedulerapi.KubeSchedulerConfiguration,

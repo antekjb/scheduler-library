@@ -22,6 +22,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 )
 
+// VerifySnapshot asserts which pods the snapshot has on which node.
 func VerifySnapshot(t *testing.T, snap *cache.Snapshot, expectedNodePods map[string][]string) {
 	t.Helper()
 	if snap == nil {
@@ -53,6 +54,8 @@ func VerifySnapshot(t *testing.T, snap *cache.Snapshot, expectedNodePods map[str
 	}
 }
 
+// VerifySnapshotPodCounts asserts how many pods the snapshot has on each node, for the cases where
+// the pod names are not known upfront.
 func VerifySnapshotPodCounts(t *testing.T, snap *cache.Snapshot, expectedCounts map[string]int) {
 	t.Helper()
 	if snap == nil {

@@ -4,3 +4,6 @@ approvers:
   - dom4ha
   - macsko
   - sanposhiho
+
+labels:
+  - sig/scheduling

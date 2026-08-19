@@ -193,6 +193,25 @@ func expectNestedTxErr() stepFn {
 	}
 }
 
+func resetMutations() stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		if err := sc.cs.ResetMutations(); err != nil {
+			t.Fatalf("ResetMutations failed: %v", err)
+		}
+	}
+}
+
+func resetMutationsErr(wantErr string) stepFn {
+	return func(t *testing.T, sc *stepContext) {
+		t.Helper()
+		err := sc.cs.ResetMutations()
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Fatalf("ResetMutations expected error containing %q, got: %v", wantErr, err)
+		}
+	}
+}
+
 func TestSnapshot_ActionSequences(t *testing.T) {
 	ctx := context.Background()
 	nodes := []*v1.Node{
@@ -411,6 +430,44 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 				verifySnapshot(map[string]sets.Set[string]{
 					"singlePodNode": sets.New("pod1"),
 					"node1":         sets.New[string]()}),
+			},
+		},
+		{
+			name:         "ResetMutations reverts scheduled pods and preemptions",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				schedule([]string{"pod2"}, []string{"node1"}, SchedulePodsOptions{}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod2")}),
+				resetMutations(),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
+			},
+		},
+		{
+			name:         "ResetMutations invalidates preemption handles",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				resetMutations(),
+				unpreemptErr("u1", "preemption handle is invalid: snapshot has been permanently mutated since preemption"),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
+			},
+		},
+		{
+			name:         "ResetMutations on empty mutations is no-op",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				resetMutations(),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
+			},
+		},
+		{
+			name:         "ResetMutations inside transaction returns error",
+			assignedPods: map[string][]string{"node1": {"pod1"}},
+			steps: []stepFn{
+				inTransaction(Commit,
+					resetMutationsErr("transaction is in progress, cannot reset mutations"),
+				),
 			},
 		},
 	}
@@ -998,5 +1055,68 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 
 			ft.VerifySnapshotPodCounts(t, snap, tc.expectSnapshotState)
 		})
+	}
+}
+
+func TestResetMutations_NodeGenerationRestored(t *testing.T) {
+	ctx := context.Background()
+
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "10",
+		v1.ResourceMemory: "10Gi",
+		v1.ResourcePods:   "110",
+	}).Obj()
+	node2 := st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "10",
+		v1.ResourceMemory: "10Gi",
+		v1.ResourcePods:   "110",
+	}).Obj()
+
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj()
+	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Node("node2").Obj()
+	pod3 := st.MakePod().Name("pod3").Namespace("default").UID("uid-pod3").Obj()
+
+	cs, snap, _ := setupSnapshotTest(t, ctx, []*v1.Node{node1, node2}, []*v1.Pod{pod1, pod2})
+
+	getGenerations := func() map[string]int64 {
+		t.Helper()
+		generations := make(map[string]int64)
+		nodes, err := snap.NodeInfos().List()
+		if err != nil {
+			t.Fatalf("NodeInfos().List() failed: %v", err)
+		}
+		for _, node := range nodes {
+			generations[node.Node().Name] = node.GetGeneration()
+		}
+		return generations
+	}
+
+	// Record initial generations for all nodes
+	initialGenerations := getGenerations()
+
+	// Update node1 by removing pod1 from it
+	_, err := cs.PreemptPods(ctx, []*v1.Pod{pod1})
+	if err != nil {
+		t.Fatalf("PreemptPods failed: %v", err)
+	}
+
+	placement, err := cs.MakePlacement([]string{"node2"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+
+	// Update node2 by scheduling pod3 to it
+	_, err = cs.SchedulePods(ctx, []*v1.Pod{pod3}, placement, SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("SchedulePods failed: %v", err)
+	}
+
+	if err := cs.ResetMutations(); err != nil {
+		t.Fatalf("ResetMutations failed: %v", err)
+	}
+
+	// Compare generations after reset with initial generations
+	if diff := cmp.Diff(initialGenerations, getGenerations()); diff != "" {
+		t.Errorf("Generations don't match (-want +got):\n%s", diff)
 	}
 }

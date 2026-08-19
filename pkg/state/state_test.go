@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/scheduler-library/pkg/framework"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
 func init() {
@@ -87,12 +88,9 @@ func TestClusterState_AddPod(t *testing.T) {
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, nil)
-			csnap, err := state.Snapshot(logger)
+			err = state.SyncSnapshot(logger)
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
-			}
-			if csnap == nil {
-				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, tc.expected)
@@ -148,12 +146,9 @@ func TestClusterState_RemovePod(t *testing.T) {
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, nil)
-			csnap, err := state.Snapshot(logger)
+			err = state.SyncSnapshot(logger)
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
-			}
-			if csnap == nil {
-				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, tc.expected)
@@ -209,12 +204,9 @@ func TestClusterState_AddNode(t *testing.T) {
 			state.Cache.AddNode(logger, tc.nodeToAdd)
 
 			ft.VerifySnapshot(t, sharedSnap, nil)
-			csnap, err := state.Snapshot(logger)
+			err := state.SyncSnapshot(logger)
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
-			}
-			if csnap == nil {
-				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, tc.expected)
@@ -266,12 +258,9 @@ func TestClusterState_RemoveNode(t *testing.T) {
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, nil)
-			csnap, err := state.Snapshot(logger)
+			err = state.SyncSnapshot(logger)
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
-			}
-			if csnap == nil {
-				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, tc.expected)
@@ -356,12 +345,9 @@ func TestClusterState_Snapshot(t *testing.T) {
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, nil)
-			csnap, err := state.Snapshot(logger)
+			err := state.SyncSnapshot(logger)
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
-			}
-			if csnap == nil {
-				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
 
 			ft.VerifySnapshot(t, sharedSnap, tc.expected)
@@ -406,12 +392,9 @@ func TestClusterState_SequentialUpdates(t *testing.T) {
 	updateSnapshot := func() action {
 		return func(t *testing.T, state *ClusterState) {
 			t.Helper()
-			csnap, err := state.Snapshot(klog.FromContext(t.Context()))
+			err := state.SyncSnapshot(klog.FromContext(t.Context()))
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
-			}
-			if csnap == nil {
-				t.Fatal("Expected ClusterSnapshot to be non-nil")
 			}
 		}
 	}
@@ -419,7 +402,7 @@ func TestClusterState_SequentialUpdates(t *testing.T) {
 	assertSnapshot := func(expected map[string]sets.Set[string]) action {
 		return func(t *testing.T, state *ClusterState) {
 			t.Helper()
-			ft.VerifySnapshot(t, state.sharedSnap, expected)
+			ft.VerifySnapshot(t, state.snapshotData, expected)
 		}
 	}
 
@@ -479,4 +462,75 @@ func newDummyProfileMap() *upstreamsync.ProfileMap {
 	return &upstreamsync.ProfileMap{
 		Map: make(profile.Map),
 	}
+}
+
+func TestClusterState_SyncSnapshot_RevertsMutations(t *testing.T) {
+	ctx := t.Context()
+	logger := klog.FromContext(ctx)
+	sharedSnap := cache.NewEmptySnapshot()
+
+	informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(), 0)
+	registry := plugins.NewInTreeRegistry()
+	prof := schedulerapi.KubeSchedulerProfile{
+		SchedulerName: "default-scheduler",
+	}
+	fwk, err := frameworkruntime.NewFramework(ctx, registry, &prof,
+		frameworkruntime.WithSnapshotSharedLister(sharedSnap),
+		frameworkruntime.WithInformerFactory(informerFactory),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create framework: %v", err)
+	}
+	profiles := &upstreamsync.ProfileMap{
+		Map: profile.Map{
+			"default-scheduler": fwk,
+		},
+	}
+
+	state := New(cache.New(ctx, nil, false), profiles, sharedSnap)
+
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "10",
+		v1.ResourceMemory: "10Gi",
+		v1.ResourcePods:   "110",
+	}).Obj()
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj()
+	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Obj()
+
+	state.Cache.AddNode(logger, node1)
+	if err := state.Cache.AddPod(logger, pod1); err != nil {
+		t.Fatalf("AddPod failed: %v", err)
+	}
+
+	err = state.SyncSnapshot(logger)
+	if err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New("pod1")})
+
+	csnap := state.GetAssociatedSnapshot()
+
+	placement, err := csnap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+
+	// Mutate snapshot by scheduling pod2
+	_, err = csnap.SchedulePods(ctx, []*v1.Pod{pod2}, placement, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("SchedulePods failed: %v", err)
+	}
+	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")})
+
+	// Calling SyncSnapshot must revert snapshot mutations (pod2 scheduling)
+	err = state.SyncSnapshot(logger)
+	if err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+
+	csnap2 := state.GetAssociatedSnapshot()
+	if csnap2 != csnap {
+		t.Errorf("Expected SyncSnapshot to return the same snapshot instance")
+	}
+	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New("pod1")})
 }

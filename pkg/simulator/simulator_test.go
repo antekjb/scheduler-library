@@ -413,7 +413,8 @@ func TestClusterState_Scheduling(t *testing.T) {
 	}
 	state.Cache.AddNode(klog.FromContext(ctx), node)
 
-	snap, err := state.Snapshot(klog.FromContext(ctx))
+	snap := state.GetAssociatedSnapshot()
+	err = state.SyncSnapshot(klog.FromContext(ctx))
 	if err != nil {
 		t.Fatalf("failed to take snapshot: %v", err)
 	}

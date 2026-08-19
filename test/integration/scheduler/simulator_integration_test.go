@@ -104,7 +104,8 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 	}
 
 	// 5. Take snapshot and run simulations
-	snap, err := cs.Snapshot(logger)
+	snap := cs.GetAssociatedSnapshot()
+	err = cs.SyncSnapshot(logger)
 	if err != nil {
 		t.Fatalf("Snapshot failed: %v", err)
 	}
@@ -150,5 +151,20 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 	}
 	if len(feasibleNodes) != 0 {
 		t.Errorf("Expected hugePod to not fit on node1 due to CPU capacity, but got feasible nodes: %v", feasibleNodes)
+	}
+
+	// 6. SyncSnapshot should revert snapshot mutations (simPod scheduling)
+	err = cs.SyncSnapshot(logger)
+	if err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+
+	// After SyncSnapshot reverts mutations, hugePod should fit on node1 again (2 existing CPU + 6 = 8 <= 10 CPU capacity)
+	feasibleNodes, diag, err = snap.CanSchedulePod(ctx, hugePod, placement)
+	if err != nil {
+		t.Fatalf("CanSchedulePod failed for hugePod after SyncSnapshot: %v", err)
+	}
+	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
+		t.Errorf("Expected hugePod to fit on node1 after SyncSnapshot reverted mutations, got feasible nodes %v, diagnosis: %v", feasibleNodes, diag)
 	}
 }

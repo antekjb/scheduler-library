@@ -15,6 +15,8 @@
 package upstreamsync
 
 import (
+	"fmt"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -68,6 +70,14 @@ func (s *MutatingSnapshot) RemovePod(logger klog.Logger, podInfo *framework.PodI
 		return err
 	}
 
+	fni, ok := ni.(*framework.NodeInfo)
+	if !ok {
+		return fmt.Errorf("unknown node info type: %T", ni)
+	}
+	oldGen := fni.Generation
+	defer func() {
+		fni.Generation = oldGen
+	}()
 	err = ni.RemovePod(logger, podInfo.Pod)
 	if err != nil {
 		return err
@@ -92,6 +102,14 @@ func (s *MutatingSnapshot) AddPod(logger klog.Logger, podInfo *framework.PodInfo
 		return err
 	}
 
+	fni, ok := ni.(*framework.NodeInfo)
+	if !ok {
+		return fmt.Errorf("unknown node info type: %T", ni)
+	}
+	oldGen := fni.Generation
+	defer func() {
+		fni.Generation = oldGen
+	}()
 	ni.AddPodInfo(podInfo)
 
 	if _, ok := s.removedPods[key]; ok {

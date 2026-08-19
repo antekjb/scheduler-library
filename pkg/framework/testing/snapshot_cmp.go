@@ -19,11 +19,13 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 )
 
-// VerifySnapshot asserts which pods the snapshot has on which node.
-func VerifySnapshot(t *testing.T, snap *cache.Snapshot, expectedNodePods map[string][]string) {
+// VerifySnapshot asserts which pods the snapshot has on which node. The pods are compared as sets,
+// as the order in which a node lists them is not part of the contract.
+func VerifySnapshot(t *testing.T, snap *cache.Snapshot, expectedNodePods map[string]sets.Set[string]) {
 	t.Helper()
 	if snap == nil {
 		t.Fatal("Expected snapshot to be non-nil")
@@ -34,22 +36,22 @@ func VerifySnapshot(t *testing.T, snap *cache.Snapshot, expectedNodePods map[str
 		t.Fatalf("Failed to list nodes: %v", err)
 	}
 
-	gotNodePods := make(map[string][]string)
+	gotNodePods := make(map[string]sets.Set[string])
 	for _, n := range nodeList {
 		if n.Node() == nil {
 			continue
 		}
 		nodeName := n.Node().Name
-		var pods []string
+		pods := sets.New[string]()
 		for _, pInfo := range n.GetPods() {
 			if pInfo != nil && pInfo.GetPod() != nil {
-				pods = append(pods, pInfo.GetPod().Name)
+				pods.Insert(pInfo.GetPod().Name)
 			}
 		}
 		gotNodePods[nodeName] = pods
 	}
 
-	if diff := cmp.Diff(expectedNodePods, gotNodePods, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(x, y string) bool { return x < y })); diff != "" {
+	if diff := cmp.Diff(expectedNodePods, gotNodePods, cmpopts.EquateEmpty()); diff != "" {
 		t.Errorf("Unexpected snapshot nodePods (-want +got):\n%s", diff)
 	}
 }

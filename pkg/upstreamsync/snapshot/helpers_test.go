@@ -302,7 +302,7 @@ func TestScheduleOnePod(t *testing.T) {
 		name          string
 		nodes         []*v1.Node
 		pod           *v1.Pod
-		candidates    []string
+		candidate     string
 		expectSuccess bool
 		expectErr     bool
 	}{
@@ -316,7 +316,7 @@ func TestScheduleOnePod(t *testing.T) {
 				}).Obj(),
 			},
 			pod:           st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").SchedulerName(v1.DefaultSchedulerName).Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Obj(),
-			candidates:    []string{"node1"},
+			candidate:     "node1",
 			expectSuccess: true,
 			expectErr:     false,
 		},
@@ -330,7 +330,7 @@ func TestScheduleOnePod(t *testing.T) {
 				}).Obj(),
 			},
 			pod:           st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").SchedulerName(v1.DefaultSchedulerName).Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj(),
-			candidates:    []string{"node1"},
+			candidate:     "node1",
 			expectSuccess: false,
 			expectErr:     false,
 		},
@@ -338,7 +338,7 @@ func TestScheduleOnePod(t *testing.T) {
 			name:          "error - framework not found",
 			nodes:         []*v1.Node{st.MakeNode().Name("node1").Obj()},
 			pod:           st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").SchedulerName("non-existent-scheduler-profile").Obj(),
-			candidates:    []string{"node1"},
+			candidate:     "node1",
 			expectSuccess: false,
 			expectErr:     true,
 		},
@@ -348,7 +348,7 @@ func TestScheduleOnePod(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			placement, err := cs.MakePlacement(tc.candidates)
+			placement, err := cs.MakePlacement([]string{tc.candidate})
 			if err != nil {
 				t.Fatalf("MakePlacement failed: %v", err)
 			}
@@ -371,9 +371,14 @@ func TestScheduleOnePod(t *testing.T) {
 				t.Fatalf("expected scheduling success %v, got %v", tc.expectSuccess, algRes.Status.IsSuccess())
 			}
 
+			// scheduleOnePod leaves the pod untouched; reflecting the result on it is up to the caller.
+			if tc.pod.Spec.NodeName != "" {
+				t.Errorf("expected pod.Spec.NodeName to remain empty, got %q", tc.pod.Spec.NodeName)
+			}
+
 			if tc.expectSuccess {
-				if tc.pod.Spec.NodeName != tc.candidates[0] {
-					t.Errorf("expected pod.Spec.NodeName to be %q, got %q", tc.candidates[0], tc.pod.Spec.NodeName)
+				if algRes.ScheduleResult.SuggestedHost != tc.candidate {
+					t.Errorf("expected SuggestedHost to be %q, got %q", tc.candidate, algRes.ScheduleResult.SuggestedHost)
 				}
 				if revertFn == nil {
 					t.Fatal("expected revertFn to be non-nil")
@@ -382,7 +387,7 @@ func TestScheduleOnePod(t *testing.T) {
 				// Revert the scheduling
 				revertFn()
 
-				nodeInfo, err := snap.Get(tc.candidates[0])
+				nodeInfo, err := snap.Get(tc.candidate)
 				if err != nil {
 					t.Fatalf("unexpected error getting node: %v", err)
 				}
@@ -390,9 +395,6 @@ func TestScheduleOnePod(t *testing.T) {
 					t.Errorf("expected 0 pods on node after revert, got %d", len(nodeInfo.GetPods()))
 				}
 			} else {
-				if tc.pod.Spec.NodeName != "" {
-					t.Errorf("expected pod.Spec.NodeName to remain empty, got %q", tc.pod.Spec.NodeName)
-				}
 				if revertFn != nil {
 					t.Error("expected revertFn to be nil")
 				}

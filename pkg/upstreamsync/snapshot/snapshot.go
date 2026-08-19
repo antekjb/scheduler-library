@@ -16,6 +16,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"math"
@@ -267,6 +268,12 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 			return result, err
 		}
 
+		if res.Status.IsSuccess() {
+			// Reflect the simulated placement on the caller's pod, so that a pod scheduled in this
+			// loop is seen as assigned by whoever inspects it, including the SchedulingResult below.
+			pod.Spec.NodeName = res.ScheduleResult.SuggestedHost
+		}
+
 		if revertFn != nil {
 			s.undoLog.registerOperation(revertFn)
 		}
@@ -322,7 +329,7 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 
 	mutatingSnapshot := upstreamsync.NewMutatingSnapshot(s.schedulerSnapshot)
 
-	unpreemptFns := []func(){}
+	unpreemptFns := []func() error{}
 
 	for _, pod := range pods {
 		revertFn, err := removePodFromNode(ctx, mutatingSnapshot, pod)
@@ -330,18 +337,27 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 			return nil, fmt.Errorf("failed to unreserve and forget pod %s: %w", klog.KObj(pod), err)
 		}
 		s.undoLog.registerOperation(revertFn)
-		unpreemptFns = append(unpreemptFns, func() {
-			revertFn()
-			s.undoLog.registerOperation(func() {
-				_, _ = removePodFromNode(ctx, mutatingSnapshot, pod)
-			})
+		// Putting the pod back is a snapshot mutation like any other, so it goes through
+		// addPodToNode and registers its own revert function, undoing it re-preempts the pod.
+		unpreemptFns = append(unpreemptFns, func() error {
+			repreemptFn, err := addPodToNode(ctx, mutatingSnapshot, pod, pod.Spec.NodeName)
+			if err != nil {
+				return fmt.Errorf("failed to unpreempt pod %s: %w", klog.KObj(pod), err)
+			}
+			s.undoLog.registerOperation(repreemptFn)
+			return nil
 		})
 	}
 
-	unpreemptFn := func() {
-		for _, revertFn := range slices.Backward(unpreemptFns) {
-			revertFn()
+	unpreemptFn := func() error {
+		var errs []error
+		for _, unpreempt := range slices.Backward(unpreemptFns) {
+			// Keep going on failure, so that as many pods as possible are put back.
+			if err := unpreempt(); err != nil {
+				errs = append(errs, err)
+			}
 		}
+		return errors.Join(errs...)
 	}
 
 	return &Unpreemption{
@@ -352,6 +368,8 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 }
 
 // Unpreempt undos the preemption done by the PreemptPods.
+// The handle is consumed even if putting some of the pods back fails, in which case the pods that
+// were restored are still registered in the undo log and are rolled back with the transaction.
 func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 	if u == nil {
 		return nil, fmt.Errorf("preemption handle is nil")
@@ -363,11 +381,15 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 		return nil, fmt.Errorf("preemption handle is invalid: already unpreempted")
 	}
 
-	u.revertFn()
+	err := u.revertFn()
 	u.reverted = true
 
 	if !s.transactionInProgress {
 		s.undoLog.commit()
+	}
+
+	if err != nil {
+		return nil, err
 	}
 
 	return u.pods, nil

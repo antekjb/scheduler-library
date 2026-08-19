@@ -89,7 +89,7 @@ type Unpreemption struct {
 	// pods are the pods that were preempted, returned to the caller by Unpreempt.
 	pods []*v1.Pod
 	// revertFn puts the pods back into the snapshot, registering the undo of each addition.
-	revertFn func()
+	revertFn func() error
 	// reverted marks the handle as consumed, so that it cannot be applied twice.
 	reverted bool
 	// validPreemptionVersion is the snapshot's preemption state version at the time of the

@@ -381,13 +381,14 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 		return nil, fmt.Errorf("preemption handle is invalid: already unpreempted")
 	}
 
+	defer func() {
+		u.reverted = true
+		if !s.transactionInProgress {
+			s.undoLog.commit()
+		}
+	}()
+
 	err := u.revertFn()
-	u.reverted = true
-
-	if !s.transactionInProgress {
-		s.undoLog.commit()
-	}
-
 	if err != nil {
 		return nil, err
 	}

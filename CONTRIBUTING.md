@@ -36,7 +36,7 @@ Any logic duplicated from the Kubernetes scheduler (e.g. to export internal code
 
 ### Marking divergences from upstream
 
-Copied code must keep the upstream doc comments verbatim, so that a copy can be diffed against its origin without guessing which comments were rewritten.
+Copied code must keep the upstream doc comments verbatim, so that a copy can be diffed against its origin without guessing which contents were rewritten.
 
 Every intentional deviation from upstream must be called out with a comment starting with the `UPSTREAM-DIFF:` prefix, stating what changed and why. Put it on the declaration when the whole function differs, or on the specific line otherwise. Listing everything that has to be reconciled before upstreaming is then a single command:
 

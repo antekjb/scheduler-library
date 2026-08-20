@@ -27,10 +27,53 @@ import (
 
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	schedFwk "k8s.io/kubernetes/pkg/scheduler/framework"
 )
+
+// Simulator is the set of "what-if" operations that run against a single in-memory view of the
+// cluster. It is implemented by *snapshot.ClusterSnapshot — what SchedulingSimulator.NewClusterSnapshot
+// returns and what state.ClusterState.Snapshot hands out — and exists to make the entry points of a
+// simulation visible from this package; consumers are not expected to implement it.
+type Simulator interface {
+	// MakePlacement turns node names into the *fwk.Placement that the other methods restrict the simulation to.
+	MakePlacement(candidateNodeNames []string) (*fwk.Placement, error)
+
+	// CanSchedulePod reports which of the nodes in the placement fit a single pod, leaving the
+	// snapshot untouched. The returned *schedFwk.Diagnosis explains why the remaining nodes were
+	// rejected.
+	CanSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) ([]string, *schedFwk.Diagnosis, error)
+
+	// SchedulePods schedules the given pods one by one onto the placement and, unless opts.DryRun is
+	// set, keeps the result in the snapshot; every scheduled pod gets its Spec.NodeName set. The
+	// returned slice holds one result per attempted pod.
+	SchedulePods(ctx context.Context, pods []*v1.Pod, placement *fwk.Placement, opts snapshot.SchedulePodsOptions) ([]snapshot.SchedulingResult, error)
+
+	// SchedulePodsByTemplate schedules as many pods created from the template as fit, up to maxPods.
+	// It stops at the first pod that does not fit, as the next identical one would not fit either;
+	// each SchedulingResult carries the generated pod, which is the only way to learn what was
+	// scheduled.
+	SchedulePodsByTemplate(ctx context.Context, template *v1.PodTemplateSpec, placement *fwk.Placement, maxPods int, opts snapshot.SchedulePodsByTemplateOptions) ([]snapshot.SchedulingResult, error)
+
+	// PreemptPods removes the given running pods from the snapshot and returns the handle that puts
+	// them back. The handle is single-use and is invalidated by any later permanent mutation of the
+	// snapshot. If any pod fails to be preempted, the ones already removed by this call are restored
+	// and an error is returned.
+	PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *snapshot.Unpreemption, err error)
+
+	// Transaction groups any of the above and commits or reverts them as a whole: the mutations are
+	// kept if transactionFn returns snapshot.Commit, and undone if it returns snapshot.Revert or an
+	// error. Transactions cannot be nested.
+	Transaction(ctx context.Context, transactionFn func() (snapshot.TransactionResult, error)) error
+
+	// Unpreempt undoes the preemption the handle was returned for and reports the pods that were put
+	// back. It fails if the handle has already been used, or if the snapshot has moved on since the
+	// preemption.
+	Unpreempt(u *snapshot.Unpreemption) ([]*v1.Pod, error)
+}
 
 // SchedulingSimulator is the entry point of the library: it owns the scheduler configuration and
 // the informers, and creates the objects the simulation is run against (see NewClusterState and
@@ -90,7 +133,7 @@ func (s *SchedulingSimulator) NewClusterState(ctx context.Context) (*state.Clust
 }
 
 // NewClusterSnapshot initializes a new snapshot with the provided pods and nodes.
-func (s *SchedulingSimulator) NewClusterSnapshot(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*snapshot.ClusterSnapshot, error) {
+func (s *SchedulingSimulator) NewClusterSnapshot(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (Simulator, error) {
 	snap := cache.NewSnapshot(pods, nodes)
 
 	profiles, err := s.buildProfileMap(ctx, snap)

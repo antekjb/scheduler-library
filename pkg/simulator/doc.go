@@ -35,21 +35,34 @@
 // # Obtaining a snapshot
 //
 // A snapshot.ClusterSnapshot is an in-memory, mutable view of the cluster that all the
-// simulation runs against. There are two ways to get one:
+// simulation runs against. These two are the only supported ways to get one:
 //
 //   - SchedulingSimulator.NewClusterState followed by state.ClusterState.Snapshot, when the
-//     simulation should start from the live cluster state. ClusterState.Cache is fed from the
-//     consumer's informers/event handlers and Snapshot freezes it.
+//     simulation should start from the live cluster state (see "Tracking the cluster" below).
 //   - SchedulingSimulator.NewClusterSnapshot, when the simulation should start from an
-//     explicitly provided set of pods and nodes.
+//     explicitly provided set of pods and nodes. Those are the whole world for that snapshot:
+//     reflecting a later change means asking for a new one.
 //
-// Prefer these constructors over building a snapshot.ClusterSnapshot directly: they are the ones
-// that register the metrics and build the full plugin chain out of the KubeSchedulerConfiguration.
+// Assembling a ClusterSnapshot by hand is not an option: all of its fields are unexported, and
+// snapshot.New — exported only because pkg/state builds on it — takes an already built profile
+// map and assumes the scheduler metrics are registered. The two entry points above are what
+// builds the plugin chain out of the KubeSchedulerConfiguration and registers those metrics.
+//
+// # Tracking the cluster
+//
+// ClusterState is long-lived and is meant to follow the real cluster: its Cache is the upstream
+// scheduler cache, fed by the consumer from its own informers or event handlers
+// (AddPod/UpdatePod/RemovePod, AddNode/UpdateNode/RemoveNode). Each ClusterState.Snapshot call
+// then folds the accumulated changes in incrementally instead of rebuilding the view from
+// scratch, which is what makes keeping a long-running simulation up to date cheap.
+//
+// The changes are applied in place, to the snapshot shared by all the scheduling profiles, so a
+// ClusterSnapshot obtained from an earlier Snapshot call must not be used afterwards.
 //
 // # Simulating
 //
-// All the simulation methods live on *snapshot.ClusterSnapshot and are the methods a consumer is
-// expected to call:
+// All the simulation methods live on *snapshot.ClusterSnapshot and are gathered in the Simulator
+// interface, which is what NewClusterSnapshot returns:
 //
 //   - MakePlacement turns node names into the *fwk.Placement that the other methods restrict
 //     the simulation to.

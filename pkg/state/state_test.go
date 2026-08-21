@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
@@ -41,18 +42,18 @@ func TestClusterState_AddPod(t *testing.T) {
 		name         string
 		existingPods []*v1.Pod
 		podToAdd     *v1.Pod
-		wantErr  bool
-		expected map[string][]string
+		wantErr      bool
+		expected     map[string]sets.Set[string]
 	}{
 		{
 			name:     "add unassigned pod",
 			podToAdd: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
-			expected: map[string][]string{"node1": {}},
+			expected: map[string]sets.Set[string]{"node1": sets.New[string]()},
 		},
 		{
 			name:     "add assigned pod",
 			podToAdd: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
-			expected: map[string][]string{"node1": {"pod1"}},
+			expected: map[string]sets.Set[string]{"node1": sets.New("pod1")},
 		},
 		{
 			name: "add duplicate pod",
@@ -61,7 +62,7 @@ func TestClusterState_AddPod(t *testing.T) {
 			},
 			podToAdd: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			wantErr:  true,
-			expected: map[string][]string{"node1": {"pod1"}},
+			expected: map[string]sets.Set[string]{"node1": sets.New("pod1")},
 		},
 	}
 
@@ -104,8 +105,8 @@ func TestClusterState_RemovePod(t *testing.T) {
 		name         string
 		existingPods []*v1.Pod
 		podToRemove  *v1.Pod
-		wantErr     bool
-		expected    map[string][]string
+		wantErr      bool
+		expected     map[string]sets.Set[string]
 	}{
 		{
 			name: "remove existing pod",
@@ -113,7 +114,7 @@ func TestClusterState_RemovePod(t *testing.T) {
 				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			},
 			podToRemove: st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
-			expected:    map[string][]string{"node1": {}},
+			expected:    map[string]sets.Set[string]{"node1": sets.New[string]()},
 		},
 		{
 			name: "remove non-existent pod",
@@ -122,7 +123,7 @@ func TestClusterState_RemovePod(t *testing.T) {
 			},
 			podToRemove: st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Node("node1").Obj(),
 			wantErr:     true,
-			expected:    map[string][]string{"node1": {"pod1"}},
+			expected:    map[string]sets.Set[string]{"node1": sets.New("pod1")},
 		},
 	}
 
@@ -165,7 +166,7 @@ func TestClusterState_AddNode(t *testing.T) {
 		name          string
 		existingNodes []*v1.Node
 		nodeToAdd     *v1.Node
-		expected      map[string][]string
+		expected      map[string]sets.Set[string]
 	}{
 		{
 			name: "add valid node",
@@ -174,7 +175,7 @@ func TestClusterState_AddNode(t *testing.T) {
 				v1.ResourceMemory: "1Gi",
 				v1.ResourcePods:   "110",
 			}).Obj(),
-			expected: map[string][]string{"node1": {}},
+			expected: map[string]sets.Set[string]{"node1": sets.New[string]()},
 		},
 		{
 			name: "add duplicate node",
@@ -190,7 +191,7 @@ func TestClusterState_AddNode(t *testing.T) {
 				v1.ResourceMemory: "1Gi",
 				v1.ResourcePods:   "110",
 			}).Obj(),
-			expected: map[string][]string{"node1": {}},
+			expected: map[string]sets.Set[string]{"node1": sets.New[string]()},
 		},
 	}
 
@@ -227,7 +228,7 @@ func TestClusterState_RemoveNode(t *testing.T) {
 		existingNodes []*v1.Node
 		nodeToRemove  *v1.Node
 		wantErr       bool
-		expected      map[string][]string
+		expected      map[string]sets.Set[string]
 	}{
 		{
 			name: "remove existing node",
@@ -235,7 +236,7 @@ func TestClusterState_RemoveNode(t *testing.T) {
 				st.MakeNode().Name("node1").Obj(),
 			},
 			nodeToRemove: st.MakeNode().Name("node1").Obj(),
-			expected:     map[string][]string{},
+			expected:     map[string]sets.Set[string]{},
 		},
 		{
 			name: "remove non-existent node",
@@ -244,7 +245,7 @@ func TestClusterState_RemoveNode(t *testing.T) {
 			},
 			nodeToRemove: st.MakeNode().Name("node2").Obj(),
 			wantErr:      true,
-			expected:     map[string][]string{"node1": {}},
+			expected:     map[string]sets.Set[string]{"node1": sets.New[string]()},
 		},
 	}
 
@@ -283,12 +284,12 @@ func TestClusterState_Snapshot(t *testing.T) {
 		name          string
 		existingNodes []*v1.Node
 		existingPods  []*v1.Pod
-		hasFramework bool
-		expected     map[string][]string
+		hasFramework  bool
+		expected      map[string]sets.Set[string]
 	}{
 		{
 			name:     "empty snapshot",
-			expected: map[string][]string{},
+			expected: map[string]sets.Set[string]{},
 		},
 		{
 			name: "snapshot with data",
@@ -298,7 +299,7 @@ func TestClusterState_Snapshot(t *testing.T) {
 			existingPods: []*v1.Pod{
 				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			},
-			expected: map[string][]string{"node1": {"pod1"}},
+			expected: map[string]sets.Set[string]{"node1": sets.New("pod1")},
 		},
 		{
 			name: "snapshot in sync with framework snapshot",
@@ -309,7 +310,7 @@ func TestClusterState_Snapshot(t *testing.T) {
 				st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
 			},
 			hasFramework: true,
-			expected:     map[string][]string{"node1": {"pod1"}},
+			expected:     map[string]sets.Set[string]{"node1": sets.New("pod1")},
 		},
 	}
 
@@ -415,7 +416,7 @@ func TestClusterState_SequentialUpdates(t *testing.T) {
 		}
 	}
 
-	assertSnapshot := func(expected map[string][]string) action {
+	assertSnapshot := func(expected map[string]sets.Set[string]) action {
 		return func(t *testing.T, state *ClusterState) {
 			t.Helper()
 			ft.VerifySnapshot(t, state.sharedSnap, expected)
@@ -438,10 +439,10 @@ func TestClusterState_SequentialUpdates(t *testing.T) {
 			steps: []action{
 				addPod(pod1),
 				updateSnapshot(),
-				assertSnapshot(map[string][]string{}),
+				assertSnapshot(map[string]sets.Set[string]{}),
 				addNode(node1),
 				updateSnapshot(),
-				assertSnapshot(map[string][]string{"node1": {"pod1"}}),
+				assertSnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
 			},
 		},
 		{
@@ -450,13 +451,13 @@ func TestClusterState_SequentialUpdates(t *testing.T) {
 				addNode(node1),
 				addPod(pod1),
 				updateSnapshot(),
-				assertSnapshot(map[string][]string{"node1": {"pod1"}}),
+				assertSnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
 				removeNode(node1),
 				updateSnapshot(),
-				assertSnapshot(map[string][]string{}),
+				assertSnapshot(map[string]sets.Set[string]{}),
 				removePod(pod1),
 				updateSnapshot(),
-				assertSnapshot(map[string][]string{}),
+				assertSnapshot(map[string]sets.Set[string]{}),
 			},
 		},
 	}

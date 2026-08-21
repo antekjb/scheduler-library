@@ -9,3 +9,8 @@ linters:
   settings:
     goheader:
       template-path: ${config-path}/hack/boilerplate.txt
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

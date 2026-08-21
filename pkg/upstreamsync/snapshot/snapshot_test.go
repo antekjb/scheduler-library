@@ -24,6 +24,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
@@ -142,7 +143,7 @@ func canSchedule(podName string, candidateNodes []string) stepFn {
 	}
 }
 
-func verifySnapshot(expected map[string][]string) stepFn {
+func verifySnapshot(expected map[string]sets.Set[string]) stepFn {
 	return func(t *testing.T, sc *stepContext) {
 		t.Helper()
 		ft.VerifySnapshot(t, sc.snap, expected)
@@ -223,9 +224,9 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 			assignedPods: map[string][]string{"node1": {"pod1"}},
 			steps: []stepFn{
 				preempt("u1", "pod1"),
-				verifySnapshot(map[string][]string{"node1": {}}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New[string]()}),
 				unpreempt("u1"),
-				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
 			},
 		},
 		{
@@ -235,13 +236,13 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 				inTransaction(Commit,
 					preempt("uA", "pod1"),
 					preempt("uB", "pod2"),
-					verifySnapshot(map[string][]string{"node1": {}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New[string]()}),
 					unpreempt("uA"),
-					verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
 					unpreempt("uB"),
-					verifySnapshot(map[string][]string{"node1": {"pod1", "pod2"}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")}),
 				),
-				verifySnapshot(map[string][]string{"node1": {"pod1", "pod2"}}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")}),
 			},
 		},
 		{
@@ -250,11 +251,11 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 			steps: []stepFn{
 				inTransaction(Revert,
 					preempt("u1", "pod1"),
-					verifySnapshot(map[string][]string{"node1": {}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New[string]()}),
 					schedule([]string{"pod"}, []string{"node1"}, SchedulePodsOptions{}),
-					verifySnapshot(map[string][]string{"node1": {"pod"}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod")}),
 				),
-				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
 			},
 		},
 		{
@@ -265,14 +266,14 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 					preempt("u1", "pod1"),
 					preempt("u2", "pod2"),
 					preempt("u3", "pod3"),
-					verifySnapshot(map[string][]string{"node1": {}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New[string]()}),
 					// Out-of-order unpreemptions
 					unpreempt("u2"),
-					verifySnapshot(map[string][]string{"node1": {"pod2"}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod2")}),
 					unpreempt("u1"),
-					verifySnapshot(map[string][]string{"node1": {"pod1", "pod2"}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")}),
 				),
-				verifySnapshot(map[string][]string{"node1": {"pod1", "pod2", "pod3"}}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2", "pod3")}),
 			},
 		},
 		{
@@ -280,7 +281,7 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 			assignedPods: map[string][]string{"node1": {"pod1"}},
 			steps: []stepFn{
 				preemptErr("has no node name", "pod1", "podNoNode"),
-				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
 			},
 		},
 		{
@@ -318,7 +319,7 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 				canSchedule("pod", []string{"node1"}),
 				schedule([]string{"pod"}, []string{"node1"}, NewSchedulePodsOptions(true, false)),
 				unpreempt("u1"),
-				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
 			},
 		},
 		{
@@ -375,9 +376,9 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 			steps: []stepFn{
 				inTransactionReturnErr("simulated transaction error",
 					preempt("u1", "pod1"),
-					verifySnapshot(map[string][]string{"node1": {}}),
+					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New[string]()}),
 				),
-				verifySnapshot(map[string][]string{"node1": {"pod1"}}),
+				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1")}),
 			},
 		},
 		{
@@ -398,18 +399,18 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 				inTransaction(Revert,
 					schedule([]string{"pod"}, []string{"singlePodNode"}, SchedulePodsOptions{}),
 					schedule([]string{"pod1"}, []string{"singlePodNode"}, SchedulePodsOptions{}),
-					verifySnapshot(map[string][]string{
-						"singlePodNode": {"pod"},
-						"node1":         {}}),
+					verifySnapshot(map[string]sets.Set[string]{
+						"singlePodNode": sets.New("pod"),
+						"node1":         sets.New[string]()}),
 					schedule([]string{"pod1"}, []string{"node1"}, SchedulePodsOptions{}),
-					verifySnapshot(map[string][]string{
-						"singlePodNode": {"pod"},
-						"node1":         {"pod1"}}),
+					verifySnapshot(map[string]sets.Set[string]{
+						"singlePodNode": sets.New("pod"),
+						"node1":         sets.New("pod1")}),
 				),
 				schedule([]string{"pod1"}, []string{"singlePodNode"}, SchedulePodsOptions{}),
-				verifySnapshot(map[string][]string{
-					"singlePodNode": {"pod1"},
-					"node1":         {}}),
+				verifySnapshot(map[string]sets.Set[string]{
+					"singlePodNode": sets.New("pod1"),
+					"node1":         sets.New[string]()}),
 			},
 		},
 	}
@@ -577,6 +578,26 @@ var scheduleResultCmpOpts = []cmp.Option{
 	}),
 }
 
+// podNameCmpOpt compares pods generated from a template by namespace and name, ignoring the random
+// UID that createPodFromTemplate appends to the name. The suffix is stripped from both sides,
+// as go-cmp requires the comparer to be symmetric; only the generated pod actually carries one.
+var podNameCmpOpt = cmp.Comparer(func(x, y *v1.Pod) bool {
+	if x == nil || y == nil {
+		return x == y
+	}
+	return x.Namespace == y.Namespace && trimGeneratedUID(x) == trimGeneratedUID(y)
+})
+
+// trimGeneratedUID drops the trailing "-<uid>" that createPodFromTemplate appends to the pod name,
+// leaving the deterministic "<template-name>-<index>" part. Pods carrying no UID - the expected
+// ones - keep their name as is.
+func trimGeneratedUID(p *v1.Pod) string {
+	if p.UID == "" {
+		return p.Name
+	}
+	return strings.TrimSuffix(p.Name, "-"+string(p.UID))
+}
+
 func TestSchedulePods(t *testing.T) {
 	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "2"}).Obj()
 	node1Capacity1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "1"}).Obj()
@@ -597,7 +618,7 @@ func TestSchedulePods(t *testing.T) {
 		candidateNodes      []string
 		opts                SchedulePodsOptions
 		expectResults       []SchedulingResult
-		expectSnapshotState map[string][]string
+		expectSnapshotState map[string]sets.Set[string]
 		expectErr           bool
 	}{
 		{
@@ -613,7 +634,7 @@ func TestSchedulePods(t *testing.T) {
 					Status:           fwk.NewStatus(fwk.Success),
 				},
 			},
-			expectSnapshotState: map[string][]string{"node1": {"pod1"}},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1")},
 		},
 		{
 			name:           "DryRun - does not persist",
@@ -628,7 +649,7 @@ func TestSchedulePods(t *testing.T) {
 					Status:           fwk.NewStatus(fwk.Success),
 				},
 			},
-			expectSnapshotState: map[string][]string{"node1": nil},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 		},
 		{
 			name:                "StopOnFailure - fails on first pod",
@@ -637,7 +658,7 @@ func TestSchedulePods(t *testing.T) {
 			candidateNodes:      []string{"node1"},
 			opts:                NewSchedulePodsOptions(false, true),
 			expectResults:       nil,
-			expectSnapshotState: map[string][]string{"node1": nil},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 			expectErr:           true,
 		},
 		{
@@ -653,7 +674,7 @@ func TestSchedulePods(t *testing.T) {
 					Status:           fwk.NewStatus(fwk.Unschedulable),
 				},
 			},
-			expectSnapshotState: map[string][]string{"node1": nil},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 		},
 		{
 			name:           "Schedule over capacity without stopping on failure",
@@ -681,8 +702,8 @@ func TestSchedulePods(t *testing.T) {
 					Status: fwk.NewStatus(fwk.Unschedulable),
 				},
 			},
-			expectSnapshotState: map[string][]string{
-				"node1": {"pod1", "pod2"},
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("pod1", "pod2"),
 			},
 		},
 		{
@@ -707,8 +728,8 @@ func TestSchedulePods(t *testing.T) {
 					Status: fwk.NewStatus(fwk.Unschedulable),
 				},
 			},
-			expectSnapshotState: map[string][]string{
-				"node1": {"pod1", "pod2"},
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("pod1", "pod2"),
 			},
 		},
 		{
@@ -729,7 +750,7 @@ func TestSchedulePods(t *testing.T) {
 					Status:           fwk.NewStatus(fwk.Unschedulable),
 				},
 			},
-			expectSnapshotState: map[string][]string{"node1": {"pod1"}, "node2": nil},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1"), "node2": nil},
 		},
 		{
 			name:           "StopOnFailure - stops on first failure even if more pods could be scheduled",
@@ -749,7 +770,7 @@ func TestSchedulePods(t *testing.T) {
 					Status:           fwk.NewStatus(fwk.Unschedulable),
 				},
 			},
-			expectSnapshotState: map[string][]string{"node1": {"pod1"}, "node2": nil},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1"), "node2": nil},
 		},
 		{
 			name:           "Error outside transaction - rolls back previous successful pods",
@@ -764,7 +785,7 @@ func TestSchedulePods(t *testing.T) {
 					Status:           fwk.NewStatus(fwk.Success),
 				},
 			},
-			expectSnapshotState: map[string][]string{"node1": nil},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 			expectErr:           true,
 		},
 	}
@@ -789,6 +810,16 @@ func TestSchedulePods(t *testing.T) {
 				t.Errorf("Unexpected scheduling results (-want +got):\n%s", diff)
 			}
 
+			// SchedulePods reflects the selected node on the pods it was given.
+			for _, res := range results {
+				if !res.Status.IsSuccess() {
+					continue
+				}
+				if res.Pod.Spec.NodeName != res.SelectedNodeName {
+					t.Errorf("expected pod %s to have NodeName %q, got %q", res.Pod.Name, res.SelectedNodeName, res.Pod.Spec.NodeName)
+				}
+			}
+
 			ft.VerifySnapshot(t, snap, tc.expectSnapshotState)
 		})
 	}
@@ -803,8 +834,16 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 		Spec:       v1.PodSpec{},
 	}
 
-	generatedPod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "templated-pod", Namespace: "default"}}
-	generatedNSPod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "templated-pod-0-", Namespace: "custom-ns"}}
+	// createPodFromTemplate names the pods it generates "<template-name>-<index>-<uuid>", and the
+	// UUID is random. The expected pods below therefore carry only the deterministic part of the
+	// name, and podNameCmpOpt strips the UUID suffix from the generated one before comparing.
+	// Keeping the index in the expectation makes the comparison exact.
+	generatedPod := func(index int) *v1.Pod {
+		return &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("templated-pod-%d", index), Namespace: "default"}}
+	}
+	generatedNSPod := func(index int) *v1.Pod {
+		return &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("templated-pod-%d", index), Namespace: "custom-ns"}}
+	}
 
 	tests := []struct {
 		name                string
@@ -826,12 +865,12 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 			opts:           SchedulePodsByTemplateOptions{},
 			expectResults: []SchedulingResult{
 				{
-					Pod:              generatedPod,
+					Pod:              generatedPod(0),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
 				{
-					Pod:              generatedPod,
+					Pod:              generatedPod(1),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
@@ -848,22 +887,22 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 			opts:           SchedulePodsByTemplateOptions{},
 			expectResults: []SchedulingResult{
 				{
-					Pod:              generatedPod,
+					Pod:              generatedPod(0),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
 				{
-					Pod:              generatedPod,
+					Pod:              generatedPod(1),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
 				{
-					Pod:              generatedPod,
+					Pod:              generatedPod(2),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
 				{
-					Pod:    generatedPod,
+					Pod:    generatedPod(3),
 					Status: fwk.NewStatus(fwk.Unschedulable),
 				},
 			},
@@ -901,12 +940,12 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 			opts:           NewSchedulePodsByTemplateOptions(true),
 			expectResults: []SchedulingResult{
 				{
-					Pod:              generatedPod,
+					Pod:              generatedPod(0),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
 				{
-					Pod:              generatedPod,
+					Pod:              generatedPod(1),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
@@ -923,7 +962,7 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 			opts:           SchedulePodsByTemplateOptions{},
 			expectResults: []SchedulingResult{
 				{
-					Pod:              generatedNSPod,
+					Pod:              generatedNSPod(0),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
@@ -951,12 +990,7 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 
 			var opts []cmp.Option
 			opts = append(opts, scheduleResultCmpOpts...)
-			opts = append(opts, cmp.Comparer(func(x, y *v1.Pod) bool {
-				if x == nil || y == nil {
-					return x == y
-				}
-				return x.Namespace == y.Namespace && (strings.HasPrefix(x.Name, y.Name) || strings.HasPrefix(y.Name, x.Name))
-			}))
+			opts = append(opts, podNameCmpOpt)
 
 			if diff := cmp.Diff(tc.expectResults, results, opts...); diff != "" {
 				t.Errorf("Unexpected scheduling results (-want +got):\n%s", diff)

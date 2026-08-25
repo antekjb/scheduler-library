@@ -95,13 +95,6 @@ func (ul *undoLog) undo() {
 	ul.stateVersion--
 }
 
-// commit makes the mutations applied so far permanent by dropping the recorded revert functions.
-// The state version keeps growing across commits, as it is only ever compared against the markers
-// taken after the last commit; it is not an index into undoOperations.
-func (ul *undoLog) commit() {
-	ul.undoOperations = nil
-}
-
 // New creates a new ClusterSnapshot stub wrapping the provided scheduler snapshot and frameworks.
 //
 // Consumers should obtain a ClusterSnapshot from simulator.SchedulingSimulator instead, either via
@@ -115,10 +108,25 @@ func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap) *ClusterSnapshot 
 	}
 }
 
+// ResetMutations restores the snapshot to its state prior to any mutations,
+// executing all accumulated undo operations in reverse order.
+func (s *ClusterSnapshot) ResetMutations() error {
+	if s.transactionInProgress {
+		return fmt.Errorf("transaction is in progress, cannot reset mutations")
+	}
+	if s.undoLog.stateVersion > 0 {
+		s.undoLog.restoreState(0)
+		s.stateVersionForPreemption++
+	}
+	return nil
+}
+
 // Transaction executes the provided function within a transaction.
 // It rolls back operations if the function returns Revert or an error.
 // Only a single active transaction is supported at any given time;
 // attempting to start a nested transaction will return an error.
+// Committed operations or operations made outside of transaction scope
+// can only be reverted by [ClusterSnapshot.ResetMutations].
 func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() (TransactionResult, error)) error {
 	if s.transactionInProgress {
 		return fmt.Errorf("a transaction is already in progress")
@@ -137,7 +145,6 @@ func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() 
 		s.undoLog.restoreState(initialStateVersion)
 		s.stateVersionForPreemption = initialStateVersionForPreemption
 	} else {
-		s.undoLog.commit()
 		// invalidate preemptions done within the transaction
 		s.stateVersionForPreemption++
 	}
@@ -245,9 +252,6 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 		if initialStateVersion != s.undoLog.stateVersion {
 			s.stateVersionForPreemption++
 		}
-		if !s.transactionInProgress {
-			s.undoLog.commit()
-		}
 	}()
 
 	result := make([]SchedulingResult, 0)
@@ -322,9 +326,6 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 		if err != nil {
 			s.undoLog.restoreState(initialStateVersion)
 		}
-		if !s.transactionInProgress {
-			s.undoLog.commit()
-		}
 	}()
 
 	mutatingSnapshot := upstreamsync.NewMutatingSnapshot(s.schedulerSnapshot)
@@ -383,9 +384,6 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 
 	defer func() {
 		u.reverted = true
-		if !s.transactionInProgress {
-			s.undoLog.commit()
-		}
 	}()
 
 	err := u.revertFn()

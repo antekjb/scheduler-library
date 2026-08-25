@@ -1,9 +1,14 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 approvers:
+  - ania-borowiec
   - dom4ha
   - macsko
   - sanposhiho
-
+reviewers:
+  - Argh4k
+  - brejman
+  - mm4tt
+  - tosi3k
 labels:
   - sig/scheduling

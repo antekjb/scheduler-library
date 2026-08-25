@@ -14,6 +14,7 @@
 
 GO_CMD ?= go
 GOLANGCI_LINT := $(GO_CMD) tool golangci-lint
+SETUP_ENVTEST := $(GO_CMD) tool setup-envtest
 
 .PHONY: all
 all: build test lint
@@ -28,7 +29,7 @@ test:
 
 .PHONY: test-integration
 test-integration:
-	$(GO_CMD) test -v -race ./test/integration/...
+	PATH="$$($(SETUP_ENVTEST) use -p path):$${PATH}" $(GO_CMD) test -v -race ./test/integration/...
 
 .PHONY: fmt
 fmt:

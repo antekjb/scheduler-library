@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/scheduler-library/pkg/framework"
 	"sigs.k8s.io/scheduler-library/pkg/state"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 
 	v1 "k8s.io/api/core/v1"
@@ -181,7 +182,7 @@ func (s *SchedulingSimulator) NewClusterSnapshot(
 }
 
 func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot) (*upstreamsync.ProfileMap, error) {
-	profiles, err := upstreamsync.NewFrameworkMap(ctx, s.comps, framework.DiscardRecorderFactory, snap)
+	profiles, err := upstreamsync.NewFrameworkMap(ctx, s.comps, framework.DiscardRecorderFactory, snap, preemption.NoopPreemptionManagerFactory)
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}

@@ -20,12 +20,15 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"reflect"
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -477,4 +480,178 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	}
 
 	return results, nil
+}
+
+// AddPodGroups adds pod groups and composite pod groups to the snapshot.
+func (s *ClusterSnapshot) AddPodGroups(
+	ctx context.Context,
+	podGroups []*schedulingv1beta1.PodGroup,
+	compositePodGroups []*schedulingv1alpha3.CompositePodGroup) (err error) {
+	initialStateVersion := s.undoLog.stateVersion
+	logger := klog.FromContext(ctx)
+	defer func() {
+		if err != nil {
+			s.undoLog.restoreState(initialStateVersion)
+		}
+	}()
+	for _, pg := range podGroups {
+		err = s.addGenericPodGroup(NewGenericPodGroup(pg))
+		if err != nil {
+			return
+		}
+		s.undoLog.registerOperation(func() {
+			if err := s.removeGenericPodGroup(NewGenericPodGroup(pg)); err != nil {
+				logger.Error(err, "failed to remove pod group", "podGroup", klog.KObj(pg))
+			}
+		})
+	}
+	for _, cpg := range compositePodGroups {
+		err = s.addGenericPodGroup(NewGenericCompositePodGroup(cpg))
+		if err != nil {
+			return
+		}
+		s.undoLog.registerOperation(func() {
+			if err := s.removeGenericPodGroup(NewGenericCompositePodGroup(cpg)); err != nil {
+				logger.Error(err, "failed to remove composite pod group", "compositePodGroup", klog.KObj(cpg))
+			}
+		})
+	}
+	return nil
+}
+
+// RemovePodGroups removes pod groups and composite pod groups from the snapshot.
+func (s *ClusterSnapshot) RemovePodGroups(
+	ctx context.Context,
+	podGroups []*schedulingv1beta1.PodGroup,
+	compositePodGroups []*schedulingv1alpha3.CompositePodGroup) (err error) {
+	initialStateVersion := s.undoLog.stateVersion
+	logger := klog.FromContext(ctx)
+	defer func() {
+		if err != nil {
+			s.undoLog.restoreState(initialStateVersion)
+		}
+	}()
+	for _, pg := range podGroups {
+		err = s.removeGenericPodGroup(NewGenericPodGroup(pg))
+		if err != nil {
+			return
+		}
+		s.undoLog.registerOperation(func() {
+			if err := s.addGenericPodGroup(NewGenericPodGroup(pg)); err != nil {
+				logger.Error(err, "failed to add pod group", "podGroup", klog.KObj(pg))
+			}
+		})
+	}
+	for _, cpg := range compositePodGroups {
+		err = s.removeGenericPodGroup(NewGenericCompositePodGroup(cpg))
+		if err != nil {
+			return
+		}
+		s.undoLog.registerOperation(func() {
+			if err := s.addGenericPodGroup(NewGenericCompositePodGroup(cpg)); err != nil {
+				logger.Error(err, "failed to add composite pod group", "compositePodGroup", klog.KObj(cpg))
+			}
+		})
+	}
+	return nil
+}
+
+// AddGenericPodGroup adds generic pod group object to the snapshot,
+// linking it to its parent composite pod group if CompositePodGroup is enabled.
+func (s *ClusterSnapshot) addGenericPodGroup(genericPodGroup *GenericPodGroup) error {
+	key := genericPodGroup.GetKey()
+	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
+
+	switch genericPodGroup.GetType() {
+	case fwk.PodGroupKeyType:
+		pgs := s.getOrCreatePodGroupState(key)
+		if pgs.podGroup != nil {
+			return fmt.Errorf("pod group %s already exists in snapshot", key)
+		}
+		pgs.setPodGroup(genericPodGroup.PodGroup)
+	case fwk.CompositePodGroupKeyType:
+		cpgs := s.getOrCreateCompositePodGroupState(key)
+		if cpgs.compositePodGroup != nil {
+			return fmt.Errorf("composite pod group %s already exists in snapshot", key)
+		}
+		cpgs.setCompositePodGroup(genericPodGroup.CompositePodGroup)
+	default:
+		return fmt.Errorf("unsupported generic pod group type %q for %s", genericPodGroup.GetType(), key)
+	}
+
+	if rv.FieldByName("compositePodGroupEnabled").Bool() {
+		if parentKey, hasParent := genericPodGroup.GetParentKey(); hasParent {
+			parent := s.getOrCreateCompositePodGroupState(parentKey)
+			parent.addChild(key)
+		}
+	}
+
+	return nil
+}
+
+// RemoveGenericPodGroup removes a generic pod group object from the snapshot,
+// unlinking it from its parent composite pod group if CompositePodGroup is enabled.
+func (s *ClusterSnapshot) removeGenericPodGroup(gpg *GenericPodGroup) error {
+	key := gpg.GetKey()
+	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
+	compositePodGroupStates := (*map[fwk.EntityKey]*compositePodGroupStateSnapshot)(rv.FieldByName("compositePodGroupStates").Addr().UnsafePointer())
+	podGroupStates := (*map[fwk.EntityKey]*podGroupStateSnapshot)(rv.FieldByName("podGroupStates").Addr().UnsafePointer())
+	compositePodGroupEnabled := rv.FieldByName("compositePodGroupEnabled").Bool()
+	switch gpg.GetType() {
+	case fwk.PodGroupKeyType:
+		pgs, exists := (*podGroupStates)[key]
+		if !exists || pgs.podGroup == nil {
+			return fmt.Errorf("pod group %s not found in snapshot", key)
+		}
+		pgs.removePodGroup()
+		if pgs.empty() {
+			delete(*podGroupStates, key)
+		}
+	case fwk.CompositePodGroupKeyType:
+		cpgs, exists := (*compositePodGroupStates)[key]
+		if !exists || cpgs.compositePodGroup == nil {
+			return fmt.Errorf("composite pod group %s not found in snapshot", key)
+		}
+		cpgs.removeCompositePodGroup()
+		if cpgs.empty() {
+			delete(*compositePodGroupStates, key)
+		}
+	default:
+		return fmt.Errorf("unsupported generic pod group type %q for %s", gpg.GetType(), key)
+	}
+
+	if compositePodGroupEnabled {
+		if parentKey, hasParent := gpg.GetParentKey(); hasParent {
+			if parent, exists := (*compositePodGroupStates)[parentKey]; exists {
+				parent.removeChild(key)
+				if parent.empty() {
+					delete(*compositePodGroupStates, parentKey)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *ClusterSnapshot) getOrCreatePodGroupState(key fwk.EntityKey) *podGroupStateSnapshot {
+	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
+	podGroupStates := (*map[fwk.EntityKey]*podGroupStateSnapshot)(rv.FieldByName("podGroupStates").Addr().UnsafePointer())
+	pgs, exists := (*podGroupStates)[key]
+	if !exists {
+		pgs = &podGroupStateSnapshot{podGroupStateData: newPodGroupStateData()}
+		(*podGroupStates)[key] = pgs
+	}
+	return pgs
+}
+
+func (s *ClusterSnapshot) getOrCreateCompositePodGroupState(key fwk.EntityKey) *compositePodGroupStateSnapshot {
+	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
+	compositePodGroupStates := (*map[fwk.EntityKey]*compositePodGroupStateSnapshot)(rv.FieldByName("compositePodGroupStates").Addr().UnsafePointer())
+	cpgs, exists := (*compositePodGroupStates)[key]
+	if !exists {
+		cpgs = &compositePodGroupStateSnapshot{compositePodGroupStateData: newCompositePodGroupStateData()}
+		(*compositePodGroupStates)[key] = cpgs
+	}
+	return cpgs
 }

@@ -492,15 +492,18 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 	pod2 := testutils.MakePod("pod2", "test-gang", "1")
 
 	result := snap.ScheduleWorkload(ctx, []*v1.Pod{pod1, pod2}, snapshot.NewScheduleWorkloadOptions(false))
-	if err != nil {
+	if result.Status.IsError() {
 		t.Fatalf("ScheduleWorkload failed: %v", err)
+	}
+	if !result.Status.IsSuccess() {
+		t.Fatalf("Expected workload to schedule, got status: %v", result.Status)
 	}
 	if len(result.PodResults) != 2 {
 		t.Fatalf("Expected 2 results, got %d", len(result.PodResults))
 	}
 	for _, r := range result.PodResults {
 		if !r.Status.IsSuccess() {
-			t.Errorf("Expected pod %s to schedule successfully, got: %v", r.Pod.Name, r.Status)
+			t.Errorf("Expected pod %s to schedule, got: %v", r.Pod.Name, r.Status)
 		}
 		if r.SelectedNodeName != "node1" {
 			t.Errorf("Expected pod %s on node1, got %q", r.Pod.Name, r.SelectedNodeName)

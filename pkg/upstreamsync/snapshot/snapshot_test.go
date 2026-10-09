@@ -1377,8 +1377,8 @@ func TestScheduleWorkload(t *testing.T) {
 			cs := New(snap, profileMap)
 
 			result := cs.ScheduleWorkload(ctx, tt.pods, tt.opts)
-			if !result.Status.IsSuccess() != tt.expectErr {
-				t.Fatalf("ScheduleWorkload() error = %v, expectErr %v", err, tt.expectErr)
+			if result.Status.IsError() != tt.expectErr {
+				t.Fatalf("ScheduleWorkload() error = %v, expectErr %v", result.Status.AsError(), tt.expectErr)
 			}
 
 			if !tt.expectErr && len(tt.expectResults) > 0 {
@@ -2061,7 +2061,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 		existingPods        []*v1.Pod
 		workloadPods        []*v1.Pod
 		buildOpts           func() (ScheduleWorkloadOptions, *cpuPreemptionFilter)
-		wantSuccess         bool
+		wantStatusCode      fwk.Code
+		wantScheduled       bool
 		wantVictimNames     []string
 		expectSnapshotState map[string]sets.Set[string]
 	}{
@@ -2084,7 +2085,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Success,
+			wantScheduled:   true,
 			wantVictimNames: nil,
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v1-pod", "v2-pod", "w-pod1", "w-pod2"),
@@ -2110,10 +2112,11 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vMed"},
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-small-pod", "v-high-pod", "w-pod1", "w-pod2"),
+				"node1": sets.New("v-small-pod", "v-med-pod", "v-high-pod"),
 			},
 		},
 		{
@@ -2135,10 +2138,11 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, nil
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vMed"},
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-small-pod", "v-high-pod", "w-pod1", "w-pod2"),
+				"node1": sets.New("v-small-pod", "v-med-pod", "v-high-pod"),
 			},
 		},
 		{
@@ -2167,10 +2171,11 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vLarge3", "vSmall"},
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-med2-pod", "w-pod1", "w-pod2"),
+				"node1": sets.New("v-small-pod", "v-med2-pod", "v-large3-pod"),
 			},
 		},
 		{
@@ -2192,10 +2197,11 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vMulti"},
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-single-1", "w-pod1", "w-pod2"),
+				"node1": sets.New("v-multi-1", "v-multi-2", "v-single-1"),
 			},
 		},
 		{
@@ -2217,14 +2223,15 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vSingle"},
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-multi-s1", "v-multi-s2", "w-pod1", "w-pod2"),
+				"node1": sets.New("v-multi-s1", "v-multi-s2", "v-single-1"),
 			},
 		},
 		{
-			name:         "(d1) CommittedVictims suffice without touching PotentialVictims and are excluded from PreemptionVictims",
+			name:         "(d1) CommittedVictims suffice without touching PotentialVictims and are included in PreemptionVictims",
 			nodes:        []*v1.Node{node8CPU},
 			existingPods: []*v1.Pod{vCommittedPod, v1Pod2CPU, v2Pod2CPU},
 			workloadPods: []*v1.Pod{
@@ -2244,14 +2251,15 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantSuccess:     true,
-			wantVictimNames: nil,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
+			wantVictimNames: []string{"vCommitted"},
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v1-pod", "v2-pod", "w-pod1", "w-pod2"),
+				"node1": sets.New("v-committed", "v1-pod", "v2-pod"),
 			},
 		},
 		{
-			name:         "(d2) CommittedVictims combined with PotentialVictims excludes CommittedVictims from PreemptionVictims",
+			name:         "(d2) CommittedVictims combined with PotentialVictims includes CommittedVictims in PreemptionVictims",
 			nodes:        []*v1.Node{node8CPU},
 			existingPods: []*v1.Pod{vCommittedPod, v1Pod2CPU, v2Pod2CPU, v3Pod2CPU},
 			workloadPods: []*v1.Pod{
@@ -2272,10 +2280,11 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantSuccess:     true,
-			wantVictimNames: []string{"v1"},
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
+			wantVictimNames: []string{"vCommitted", "v1"},
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v2-pod", "v3-pod", "w-pod1", "w-pod2"),
+				"node1": sets.New("v-committed", "v1-pod", "v2-pod", "v3-pod"),
 			},
 		},
 		{
@@ -2299,7 +2308,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantSuccess:     false,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   false,
 			wantVictimNames: nil,
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-committed", "v1-pod", "v2-pod"),
@@ -2319,14 +2329,15 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vHigh := &testVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}}
 				f := newCPUPreemptionFilter(3)
 				return ScheduleWorkloadOptions{
-					DryRun: true,
+					CommonSchedulingOptions: CommonSchedulingOptions{DryRun: true},
 					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
 						PotentialVictims: slices.Values([]PreemptionVictim{vSmall, vMed, vHigh}),
 						PreemptionFilter: f,
 					},
 				}, f
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vMed"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-small-pod", "v-med-pod", "v-high-pod"),
@@ -2355,8 +2366,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				t.Fatalf("ScheduleWorkload() unexpected error: %v", result.Status.AsError())
 			}
 
-			if result.Status.IsSuccess() != tt.wantSuccess {
-				t.Fatalf("ScheduleWorkload() Status.IsSuccess() = %v, want %v (status: %v)", result.Status.IsSuccess(), tt.wantSuccess, result.Status)
+			if result.Status.Code() != tt.wantStatusCode {
+				t.Fatalf("ScheduleWorkload() Status.Code() = %v, want %v (status: %v)", result.Status.Code(), tt.wantStatusCode, result.Status)
 			}
 
 			gotVictims := victimNames(result.PreemptionVictims)
@@ -2364,7 +2375,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				t.Errorf("PreemptionVictims mismatch (-want +got):\n%s", diff)
 			}
 
-			if tt.wantSuccess {
+			if tt.wantScheduled {
+				if len(result.PodResults) != len(tt.workloadPods) {
+					t.Fatalf("ScheduleWorkload() len(PodResults) = %d, want %d", len(result.PodResults), len(tt.workloadPods))
+				}
 				for _, pRes := range result.PodResults {
 					if !pRes.Status.IsSuccess() {
 						t.Errorf("pod %s expected success, got %v", pRes.Pod.Name, pRes.Status)
@@ -2376,17 +2390,13 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 						t.Errorf("pod %s Spec.NodeName = %q, want \"node1\"", pRes.Pod.Name, pRes.Pod.Spec.NodeName)
 					}
 				}
-				if filter != nil && len(opts.CommittedVictims) == 0 {
+				if filter != nil {
 					if len(filter.activeVictims) != len(result.PreemptionVictims) {
 						t.Errorf("filter activeVictims count = %d, want %d", len(filter.activeVictims), len(result.PreemptionVictims))
 					}
 				}
-			} else {
-				for _, pRes := range result.PodResults {
-					if pRes.SelectedNodeName != "" {
-						t.Errorf("pod %s expected empty SelectedNodeName on failure, got %q", pRes.Pod.Name, pRes.SelectedNodeName)
-					}
-				}
+			} else if len(result.PodResults) != 0 {
+				t.Errorf("expected empty PodResults on failure, got %v", result.PodResults)
 			}
 
 			ft.VerifySnapshot(t, snap, tt.expectSnapshotState)

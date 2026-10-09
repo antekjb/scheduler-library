@@ -25,6 +25,7 @@ import (
 	"k8s.io/client-go/informers"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
@@ -194,8 +195,8 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 			}
 
 			res := snap.ScheduleWorkload(ctx, tt.pods, snapshot.NewScheduleWorkloadOptions(false))
-			if !res.Status.IsSuccess() {
-				t.Fatalf("ScheduleWorkload failed: %v", err)
+			if res.Status.IsError() {
+				t.Fatalf("ScheduleWorkload failed: %v", res.Status.AsError())
 			}
 			if res.Status.IsSuccess() != tt.wantSuccess {
 				t.Errorf("Workload Status.IsSuccess() = %v, want %v (status: %v)", res.Status.IsSuccess(), tt.wantSuccess, res.Status)
@@ -287,14 +288,14 @@ func TestSimulatorIntegration_AddAndRemovePodGroups(t *testing.T) {
 
 	assertScheduleWorkloadSuccess := func(pods []*v1.Pod, dryRun bool) {
 		t.Helper()
-		res, err := snap.ScheduleWorkload(ctx, pods, snapshot.NewScheduleWorkloadOptions(dryRun))
-		if err != nil {
-			t.Fatalf("ScheduleWorkload unexpected error: %v", err)
+		res := snap.ScheduleWorkload(ctx, pods, snapshot.NewScheduleWorkloadOptions(dryRun))
+		if res.Status.IsError() {
+			t.Fatalf("ScheduleWorkload unexpected error: %v", res.Status.AsError())
 		}
-		if len(res) != len(pods) {
-			t.Fatalf("ScheduleWorkload returned %d results, want %d", len(res), len(pods))
+		if len(res.PodResults) != len(pods) {
+			t.Fatalf("ScheduleWorkload returned %d results, want %d", len(res.PodResults), len(pods))
 		}
-		for _, r := range res {
+		for _, r := range res.PodResults {
 			if !r.Status.IsSuccess() {
 				t.Errorf("pod %s Status.IsSuccess() = false, want true (status: %v)", r.Pod.Name, r.Status)
 			}
@@ -303,7 +304,7 @@ func TestSimulatorIntegration_AddAndRemovePodGroups(t *testing.T) {
 
 	assertScheduleWorkloadError := func(pods []*v1.Pod) {
 		t.Helper()
-		if _, err := snap.ScheduleWorkload(ctx, pods, snapshot.NewScheduleWorkloadOptions(false)); err == nil {
+		if res := snap.ScheduleWorkload(ctx, pods, snapshot.NewScheduleWorkloadOptions(false)); !res.Status.IsError() {
 			t.Fatalf("Expected ScheduleWorkload to fail when pod group is missing from snapshot, got nil error")
 		}
 	}
@@ -510,7 +511,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 		existingPods    []*v1.Pod
 		workloadPods    []*v1.Pod
 		opts            snapshot.ScheduleWorkloadOptions
-		wantSuccess     bool
+		wantStatusCode  fwk.Code
+		wantScheduled   bool
 		wantVictimNames []string
 		probePodCPU     string
 		wantProbeFits   bool
@@ -532,7 +534,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 2},
 				},
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Success,
+			wantScheduled:   true,
 			wantVictimNames: nil,
 			probePodCPU:     "1",
 			wantProbeFits:   false,
@@ -555,10 +558,11 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 3},
 				},
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vMed"},
 			probePodCPU:     "1",
-			wantProbeFits:   false,
+			wantProbeFits:   true,
 		},
 		{
 			name:         "(c) multi-pod PreemptionVictim preempted and restored atomically",
@@ -577,13 +581,14 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 4},
 				},
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vSingle"},
 			probePodCPU:     "1",
 			wantProbeFits:   false,
 		},
 		{
-			name:         "(d) CommittedVictims removed upfront and excluded from PreemptionVictims",
+			name:         "(d) CommittedVictims removed upfront and included in PreemptionVictims",
 			nodes:        []*v1.Node{node8CPU},
 			existingPods: []*v1.Pod{vCommittedPod, v1Pod, v2Pod},
 			workloadPods: []*v1.Pod{
@@ -602,10 +607,11 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 2},
 				},
 			},
-			wantSuccess:     true,
-			wantVictimNames: []string{"v1"},
-			probePodCPU:     "1",
-			wantProbeFits:   false,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
+			wantVictimNames: []string{"vCommitted", "v1"},
+			probePodCPU:     "2",
+			wantProbeFits:   true,
 		},
 		{
 			name:         "(e) fails when all PotentialVictims are insufficient and reverts snapshot",
@@ -624,7 +630,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 2},
 				},
 			},
-			wantSuccess:     false,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   false,
 			wantVictimNames: nil,
 			probePodCPU:     "2",
 			wantProbeFits:   true,
@@ -638,7 +645,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				makePod(ns, "w-f2", "preempt-gang", "2"),
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
-				DryRun: true,
+				CommonSchedulingOptions: snapshot.CommonSchedulingOptions{DryRun: true},
 				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
 					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
 						&integrationVictim{name: "vSmall", pods: []*v1.Pod{vSmallPod}},
@@ -648,7 +655,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 3},
 				},
 			},
-			wantSuccess:     true,
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
 			wantVictimNames: []string{"vMed"},
 			probePodCPU:     "2",
 			wantProbeFits:   false,
@@ -687,8 +695,20 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			if res.Status.IsError() {
 				t.Fatalf("ScheduleWorkload failed: %v", res.Status.AsError())
 			}
-			if res.Status.IsSuccess() != tt.wantSuccess {
-				t.Fatalf("Status.IsSuccess() = %v, want %v (status: %v)", res.Status.IsSuccess(), tt.wantSuccess, res.Status)
+			if res.Status.Code() != tt.wantStatusCode {
+				t.Fatalf("Status.Code() = %v, want %v (status: %v)", res.Status.Code(), tt.wantStatusCode, res.Status)
+			}
+			if tt.wantScheduled {
+				if len(res.PodResults) != len(tt.workloadPods) {
+					t.Fatalf("len(PodResults) = %d, want %d", len(res.PodResults), len(tt.workloadPods))
+				}
+				for _, pRes := range res.PodResults {
+					if !pRes.Status.IsSuccess() {
+						t.Errorf("pod %s expected success, got %v", pRes.Pod.Name, pRes.Status)
+					}
+				}
+			} else if len(res.PodResults) != 0 {
+				t.Errorf("expected empty PodResults on failure, got %v", res.PodResults)
 			}
 
 			var gotVictims []string

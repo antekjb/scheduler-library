@@ -440,10 +440,10 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	initialStateVersion := s.undoLog.stateVersion
 
 	defer func() {
-		if result.Status == nil || !result.Status.IsSuccess() || opts.DryRun {
+		if !result.Status.IsSuccess() || opts.DryRun {
 			s.undoLog.restoreState(initialStateVersion)
 		}
-		if result.Status != nil && result.Status.IsSuccess() {
+		if result.Status.IsSuccess() {
 			for _, r := range result.PodResults {
 				if r.SelectedNodeName != "" && r.Pod != nil {
 					r.Pod.Spec.NodeName = r.SelectedNodeName
@@ -465,46 +465,59 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 		return WorkloadSchedulingResult{Status: fwk.AsStatus(fmt.Errorf("failed to get framework for pod group: %w", err))}
 	}
 
-	// Stage 1a: Evict CommittedVictims before the first scheduling attempt.
+	// Stage 0: Initial scheduling attempt without preempting.
+	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, 1, nil)
+	podGroupCycleState := framework.NewCycleState()
+	rootKey := getEntityKey(podGroupInfo)
+
+	algResultsMap, revertFn := sched.RunRootSchedulingAlgorithm(ctx, schedFramework, podGroupCycleState, podGroupInfo)
+
+	result = WorkloadSchedulingResult{
+		Status:     algResultsMap[rootKey].Status,
+		PodResults: buildWorkloadPodResults(algResultsMap, algResultsMap[rootKey]),
+	}
+
+	if result.Status.IsSuccess() {
+		if revertFn != nil {
+			s.undoLog.registerOperation(revertFn)
+		}
+		return result
+	}
+
+	if result.Status.Code() != fwk.Unschedulable || (opts.PotentialVictims == nil && opts.CommittedVictims == nil) {
+		return result
+	}
+
+	// Stage 1a: Evict CommittedVictims and check if it is enough.
+	removedCommittedVictims := false
 	for _, v := range opts.CommittedVictims {
 		if v == nil {
 			continue
-		}
-		if opts.PreemptionFilter != nil {
-			opts.PreemptionFilter.PreemptVictim(v)
 		}
 		if len(v.Pods()) > 0 {
 			if _, err := s.PreemptPods(ctx, v.Pods()); err != nil {
 				return WorkloadSchedulingResult{Status: fwk.AsStatus(err)}
 			}
+			removedCommittedVictims = true
+		}
+		if opts.PreemptionFilter != nil {
+			opts.PreemptionFilter.PreemptVictim(v)
 		}
 	}
 
-	// Stage 0: Initial scheduling attempt without preempting PotentialVictims.
-	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, 1, nil)
-	podGroupCycleState := framework.NewCycleState()
-	algResultsMap, revertFn := sched.RunRootSchedulingAlgorithm(ctx, schedFramework, podGroupCycleState, podGroupInfo)
-
-	rootKey := getEntityKey(podGroupInfo)
-	rootResult := algResultsMap[rootKey]
-
-	if rootResult.Status.IsSuccess() {
-		if revertFn != nil {
-			s.undoLog.registerOperation(revertFn)
+	if removedCommittedVictims && (opts.PreemptionFilter == nil || opts.PreemptionFilter.MayFit()) {
+		finalAlgResultsMap, finalRevertFn := sched.RunRootSchedulingAlgorithm(ctx, schedFramework, framework.NewCycleState(), podGroupInfo)
+		finalRootResult := finalAlgResultsMap[rootKey]
+		if finalRootResult.Status.IsSuccess() {
+			if finalRevertFn != nil {
+				s.undoLog.registerOperation(finalRevertFn)
+			}
+			return WorkloadSchedulingResult{
+				Status:            result.Status,
+				PodResults:        buildWorkloadPodResults(finalAlgResultsMap, finalRootResult),
+				PreemptionVictims: opts.CommittedVictims,
+			}
 		}
-		return WorkloadSchedulingResult{
-			Status:     rootResult.Status,
-			PodResults: buildWorkloadPodResults(algResultsMap, rootResult),
-		}
-	}
-
-	initialResult := WorkloadSchedulingResult{
-		Status:     rootResult.Status,
-		PodResults: buildWorkloadPodResults(algResultsMap, rootResult),
-	}
-
-	if rootResult.Status.Code() != fwk.Unschedulable || opts.PotentialVictims == nil {
-		return initialResult
 	}
 
 	// Stage 1b and Stage 2: Pull PotentialVictims and run PodGroup preemption with reprieval.
@@ -536,7 +549,6 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 		schedFramework.SetPreemptionManager(pm)
 		_, postFilterStatus := schedFramework.RunPodGroupPostFilterPlugins(ctx, podGroupCycleState, podGroupInfo, pgSchedulingFunc)
 		if postFilterStatus.IsError() {
-			err = postFilterStatus.AsError()
 			return WorkloadSchedulingResult{Status: postFilterStatus}
 		}
 		if postFilterStatus.IsSuccess() && pm.actuated {
@@ -547,7 +559,7 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	}
 
 	if !preemptionSucceeded {
-		return initialResult
+		return WorkloadSchedulingResult{Status: result.Status}
 	}
 
 	// Final Commit: Remove non-reprieved victims and run the scheduling algorithm to commit placements.
@@ -567,9 +579,9 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	finalRootResult := finalAlgResultsMap[rootKey]
 
 	return WorkloadSchedulingResult{
-		Status:            finalRootResult.Status,
+		Status:            result.Status,
 		PodResults:        buildWorkloadPodResults(finalAlgResultsMap, finalRootResult),
-		PreemptionVictims: preemptedVictims,
+		PreemptionVictims: append(opts.CommittedVictims, preemptedVictims...),
 	}
 }
 

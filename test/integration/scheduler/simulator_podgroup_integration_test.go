@@ -209,6 +209,172 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 	}
 }
 
+func TestSimulatorIntegration_AddAndRemovePodGroups(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload:                 true,
+		features.TopologyAwareWorkloadScheduling: true,
+		features.CompositePodGroup:               true,
+	})
+
+	testCtx := testutils.InitTestAPIServer(t, "sim-pg-snapshot", nil)
+	if testCtx == nil {
+		t.Fatal("Expected testCtx to be non-nil")
+	}
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	client := testCtx.ClientSet
+	ns := testCtx.NS.Name
+
+	cfg := newKubeSchedulerConfig(withTopologyPlacementGenerator)
+
+	readonlyClient, err := simulator.NewReadonlyClient(testCtx.KubeConfig)
+	if err != nil {
+		t.Fatalf("NewReadonlyClient failed: %v", err)
+	}
+
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := simulator.NewSchedulingSimulator(ctx, cfg, readonlyClient, informerFactory)
+	if err != nil {
+		t.Fatalf("NewSchedulingSimulator failed: %v", err)
+	}
+
+	cs, err := sim.NewClusterState(ctx)
+	if err != nil {
+		t.Fatalf("NewClusterState failed: %v", err)
+	}
+
+	tasNode1 := st.MakeNode().Name("node1").Label(zoneLabel, "zone-a").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	tasNode2 := st.MakeNode().Name("node2").Label(zoneLabel, "zone-b").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	initialPG := makePodGroup(ns, "initial-gang", "", 2, "")
+	initialPod1 := makePod(ns, "initial-pod-1", "initial-gang", "2")
+	initialPod2 := makePod(ns, "initial-pod-2", "initial-gang", "2")
+	initialPods := []*v1.Pod{initialPod1, initialPod2}
+
+	addedPG := makePodGroup(ns, "added-gang", "", 2, "")
+	addedPod1 := makePod(ns, "added-pod-1", "added-gang", "2")
+	addedPod2 := makePod(ns, "added-pod-2", "added-gang", "2")
+	addedPods := []*v1.Pod{addedPod1, addedPod2}
+
+	rootTASCPG := makeCompositePodGroup(ns, "root-tas-cpg", 2, zoneLabel)
+	leafTASPG1 := makePodGroup(ns, "leaf-tas-1", "root-tas-cpg", 0, "")
+	leafTASPG2 := makePodGroup(ns, "leaf-tas-2", "root-tas-cpg", 0, "")
+	cpgTASPod1 := makePod(ns, "cpg-tas-pod-1", "leaf-tas-1", "2")
+	cpgTASPod2 := makePod(ns, "cpg-tas-pod-2", "leaf-tas-2", "2")
+	cpgTASPods := []*v1.Pod{cpgTASPod1, cpgTASPod2}
+
+	// 1. Add nodes and initialPG to cluster state cache, then sync snapshot.
+	cs.Cache.AddNode(logger, tasNode1)
+	cs.Cache.AddNode(logger, tasNode2)
+	cs.Cache.AddPodGroup(initialPG)
+
+	snap := cs.GetAssociatedSnapshot()
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+
+	assertScheduleWorkloadSuccess := func(pods []*v1.Pod, dryRun bool) {
+		t.Helper()
+		res, err := snap.ScheduleWorkload(ctx, pods, snapshot.NewScheduleWorkloadOptions(dryRun))
+		if err != nil {
+			t.Fatalf("ScheduleWorkload unexpected error: %v", err)
+		}
+		if len(res) != len(pods) {
+			t.Fatalf("ScheduleWorkload returned %d results, want %d", len(res), len(pods))
+		}
+		for _, r := range res {
+			if !r.Status.IsSuccess() {
+				t.Errorf("pod %s Status.IsSuccess() = false, want true (status: %v)", r.Pod.Name, r.Status)
+			}
+		}
+	}
+
+	assertScheduleWorkloadError := func(pods []*v1.Pod) {
+		t.Helper()
+		if _, err := snap.ScheduleWorkload(ctx, pods, snapshot.NewScheduleWorkloadOptions(false)); err == nil {
+			t.Fatalf("Expected ScheduleWorkload to fail when pod group is missing from snapshot, got nil error")
+		}
+	}
+
+	// 2. Verify initialPG can be scheduled, while addedPG (not yet in snapshot) fails.
+	assertScheduleWorkloadSuccess(initialPods, true)
+	assertScheduleWorkloadError(addedPods)
+
+	// 3. Remove initialPG from snapshot and verify it can no longer be scheduled.
+	if err := snap.RemovePodGroup(ctx, initialPG); err != nil {
+		t.Fatalf("RemovePodGroup(initialPG) failed: %v", err)
+	}
+	assertScheduleWorkloadError(initialPods)
+
+	// 4. Add addedPG to snapshot and verify its workload can now be scheduled.
+	if err := snap.AddPodGroup(ctx, addedPG); err != nil {
+		t.Fatalf("AddPodGroup(addedPG) failed: %v", err)
+	}
+	assertScheduleWorkloadSuccess(addedPods, true)
+
+	// 5. Add and remove a multi-level CompositePodGroup hierarchy on snapshot.
+	if err := snap.AddCompositePodGroup(ctx, rootTASCPG); err != nil {
+		t.Fatalf("AddCompositePodGroup(rootTASCPG) failed: %v", err)
+	}
+	for _, pg := range []*schedulingv1beta1.PodGroup{leafTASPG1, leafTASPG2} {
+		if err := snap.AddPodGroup(ctx, pg); err != nil {
+			t.Fatalf("AddPodGroup(%s) failed: %v", pg.Name, err)
+		}
+	}
+	assertScheduleWorkloadSuccess(cpgTASPods, true)
+
+	for _, pg := range []*schedulingv1beta1.PodGroup{leafTASPG1, leafTASPG2} {
+		if err := snap.RemovePodGroup(ctx, pg); err != nil {
+			t.Fatalf("RemovePodGroup(%s) failed: %v", pg.Name, err)
+		}
+	}
+	if err := snap.RemoveCompositePodGroup(ctx, rootTASCPG); err != nil {
+		t.Fatalf("RemoveCompositePodGroup(rootTASCPG) failed: %v", err)
+	}
+	assertScheduleWorkloadError(cpgTASPods)
+
+	// 6. Verify Add and Remove roll back when a Transaction is reverted.
+	if err := snap.Transaction(ctx, func() (snapshot.TransactionResult, error) {
+		if err := snap.AddCompositePodGroup(ctx, rootTASCPG); err != nil {
+			t.Fatalf("AddCompositePodGroup in transaction failed: %v", err)
+		}
+		for _, pg := range []*schedulingv1beta1.PodGroup{leafTASPG1, leafTASPG2} {
+			if err := snap.AddPodGroup(ctx, pg); err != nil {
+				t.Fatalf("AddPodGroup in transaction failed: %v", err)
+			}
+		}
+		if err := snap.RemovePodGroup(ctx, addedPG); err != nil {
+			t.Fatalf("RemovePodGroup in transaction failed: %v", err)
+		}
+
+		assertScheduleWorkloadSuccess(cpgTASPods, false)
+		assertScheduleWorkloadError(addedPods)
+
+		return snapshot.Revert, nil
+	}); err != nil {
+		t.Fatalf("Transaction failed: %v", err)
+	}
+
+	// After transaction revert, hierarchy is gone and addedPG is back.
+	assertScheduleWorkloadError(cpgTASPods)
+	assertScheduleWorkloadSuccess(addedPods, false)
+
+	// 7. SyncSnapshot resets snapshot mutations back to the ClusterState cache (initialPG present, addedPG absent).
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+	assertScheduleWorkloadError(addedPods)
+	assertScheduleWorkloadSuccess(initialPods, false)
+}
+
 func makePod(ns, name, podGroupName, cpu string) *v1.Pod {
 	pod := st.MakePod().Name(name).Namespace(ns)
 	if podGroupName != "" {

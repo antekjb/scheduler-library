@@ -33,19 +33,17 @@ import (
 
 // PodGroupEvaluator is a preemption evaluator that knows how to run
 // preemption where a preemptor is a pod group across the whole cluster.
-// UPSTREAM-DIFF: It is additionally holding PreemptionManager.
+//
+// Migration Plan (1.38): Delete this file once k8s.io/kubernetes 1.38 includes upstream PodGroupEvaluator.
 type PodGroupEvaluator struct {
-	Handle            fwk.Handle
-	PreemptionManager PreemptionManager
+	Handle Handle
 }
 
 // NewPodGroupEvaluator creates a new PodGroupEvaluator.
-func NewPodGroupEvaluator(fh fwk.Handle, pm PreemptionManager) *PodGroupEvaluator {
-	evaluator := &PodGroupEvaluator{
-		Handle:            fh,
-		PreemptionManager: pm,
+func NewPodGroupEvaluator(fh Handle) *PodGroupEvaluator {
+	return &PodGroupEvaluator{
+		Handle: fh,
 	}
-	return evaluator
 }
 
 // evaluate determines the victims for preemption, without actuation.
@@ -71,7 +69,7 @@ func (ev *PodGroupEvaluator) evaluate(ctx context.Context, potentialVictims []Pr
 // The caller is expected to backup the NodeInfo before calling this function
 // And rollback the state to the backup after function is finished.
 func (ev *PodGroupEvaluator) Preempt(ctx context.Context, pgInfo fwk.PodGroupInfo, podGroupSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-	preemptionManager := ev.PreemptionManager
+	preemptionManager := ev.Handle.PreemptionManager()
 
 	if preemptionManager.Executor().IsPodGroupWaitingForVictims(pgInfo) {
 		return &fwk.PodGroupPostFilterResult{NominatingInfos: buildCurrentNominatingInfos(pgInfo)}, fwk.NewStatus(fwk.Success, "ongoing preemption on nominated nodes")
@@ -202,7 +200,7 @@ func (ev *PodGroupEvaluator) selectVictimsOnDomain(
 			validAssignment = append(validAssignment, assignment)
 		}
 	}
-	reprieveFilter := ev.PreemptionManager.NewReprieveFilter(ctx, potentialVictims)
+	reprieveFilter := ev.Handle.PreemptionManager().NewReprieveFilter(ctx, potentialVictims)
 	if reprieveFilter == nil {
 		return nil, fwk.NewStatus(fwk.Error, "got nil reprieve filter")
 	}

@@ -127,6 +127,40 @@ func (sched *Scheduler) RunRootSchedulingAlgorithm(
 	return results, revertFns.revert
 }
 
+// BuildPodGroupSchedulingFunc returns a PodGroupSchedulingFunc that runs the root
+// pod group scheduling algorithm in a fresh CycleState and collects proposed
+// assignments from successful leaf pod groups.
+//
+// UPSTREAM-DIFF: Adapted from Scheduler.buildPodGroupSchedulingFunc in
+// pkg/scheduler/schedule_one_podgroup.go (kubernetes/kubernetes#142979), with one difference:
+// Calls revertFn() immediately because RunRootSchedulingAlgorithm in upstreamsync
+// returns revertFn to the caller instead of deferring it internally.
+// Migration Plan (1.38): Replace with PodGroupSchedulingAlgorithm.BuildPodGroupSchedulingFunc
+// once kubernetes/kubernetes#142979 and kubernetes/kubernetes#141852 merge.
+func (sched *Scheduler) BuildPodGroupSchedulingFunc(
+	schedFwk framework.Framework,
+	podGroupInfo *framework.PodGroupInfo,
+) fwk.PodGroupSchedulingFunc {
+	rootKey := getEntityKey(podGroupInfo)
+	return func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
+		results, revertFn := sched.RunRootSchedulingAlgorithm(ctx, schedFwk, framework.NewCycleState(), podGroupInfo)
+		if revertFn != nil {
+			revertFn()
+		}
+		rootResult := results[rootKey]
+		if !rootResult.Status.IsSuccess() {
+			return nil, rootResult.Status
+		}
+		var proposedAssignments []fwk.ProposedAssignment
+		for res := range successfulLeafResults(podGroupInfo, results) {
+			proposedAssignments = append(proposedAssignments, makeProposedAssignments(res)...)
+		}
+		return &fwk.PodGroupAssignments{
+			ProposedAssignments: proposedAssignments,
+		}, rootResult.Status
+	}
+}
+
 // podGroupSchedulingRecursiveAlgorithm runs a recursive pod group scheduling algorithm.
 // If the pod group info wraps a composite pod group, it will recursively invoke the algorithm on its children.
 // Otherwise, the pod group info wraps a leaf pod group for which we invoke the standard pod group scheduling algorithm.
@@ -669,6 +703,19 @@ func (sched *Scheduler) findBestPlacement(
 	return bestScore.Placement, nil
 }
 
+// makeProposedAssignments extracts ProposedAssignment entries for pods that were assigned a host.
+//
+// UPSTREAM-DIFF: none, copied verbatim.
+func makeProposedAssignments(res *PodGroupAlgorithmResult) []fwk.ProposedAssignment {
+	proposedAssignments := make([]fwk.ProposedAssignment, 0, len(res.PodResults))
+	for i := range res.PodResults {
+		if res.PodResults[i].scheduleResult.SuggestedHost != "" {
+			proposedAssignments = append(proposedAssignments, &res.PodResults[i])
+		}
+	}
+	return proposedAssignments
+}
+
 // makePodGroupAssignments converts scheduling results for PodGroup from candidate placements into the format
 // required by PlacementScore plugins to score and select the best placement for the pod group.
 //
@@ -677,15 +724,9 @@ func makePodGroupAssignments(successfulResults map[*fwk.Placement]*PodGroupAlgor
 	placementAssignments := make([]*fwk.PodGroupAssignments, 0, len(successfulResults))
 	placementStates := make([]fwk.PlacementCycleState, 0, len(successfulResults))
 	for placement, res := range successfulResults {
-		proposedAssignments := make([]fwk.ProposedAssignment, 0, len(res.PodResults))
-		for i := range res.PodResults {
-			if res.PodResults[i].scheduleResult.SuggestedHost != "" {
-				proposedAssignments = append(proposedAssignments, &res.PodResults[i])
-			}
-		}
 		placementAssignments = append(placementAssignments, &fwk.PodGroupAssignments{
 			Placement:           placement,
-			ProposedAssignments: proposedAssignments,
+			ProposedAssignments: makeProposedAssignments(res),
 		})
 		placementStates = append(placementStates, res.PlacementCycleState)
 	}
@@ -705,11 +746,7 @@ func makeCompositePodGroupAssignments(
 	for placement, subtreeResults := range successfulResults {
 		var combinedProposedAssignments []fwk.ProposedAssignment
 		for result := range successfulLeafResults(pgi, subtreeResults) {
-			for i := range result.PodResults {
-				if result.PodResults[i].scheduleResult.SuggestedHost != "" {
-					combinedProposedAssignments = append(combinedProposedAssignments, &result.PodResults[i])
-				}
-			}
+			combinedProposedAssignments = append(combinedProposedAssignments, makeProposedAssignments(result)...)
 		}
 		placementPodGroupAssignments = append(placementPodGroupAssignments, &fwk.PodGroupAssignments{
 			Placement:           placement,

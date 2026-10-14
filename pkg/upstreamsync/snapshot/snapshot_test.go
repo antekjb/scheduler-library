@@ -1304,16 +1304,13 @@ func TestScheduleWorkload(t *testing.T) {
 			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 		},
 		{
-			name:               "Failure - gang unschedulable rolls back snapshot reservations",
-			nodes:              []*v1.Node{node4CPU},
-			podGroups:          []*schedulingv1beta1.PodGroup{gangPG},
-			compositePodGroups: nil,
-			pods:               []*v1.Pod{heavyPod1, heavyPod2},
-			opts:               NewScheduleWorkloadOptions(false),
-			expectResults: []SchedulingResult{
-				{Pod: heavyPod1, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "no pods were schedulable")},
-				{Pod: heavyPod2, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "pod group is unschedulable")},
-			},
+			name:                "Failure - gang unschedulable rolls back snapshot reservations",
+			nodes:               []*v1.Node{node4CPU},
+			podGroups:           []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups:  nil,
+			pods:                []*v1.Pod{heavyPod1, heavyPod2},
+			opts:                NewScheduleWorkloadOptions(false),
+			expectResults:       nil,
 			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 		},
 		{
@@ -1381,7 +1378,7 @@ func TestScheduleWorkload(t *testing.T) {
 				t.Fatalf("ScheduleWorkload() error = %v, expectErr %v", result.Status.AsError(), tt.expectErr)
 			}
 
-			if !tt.expectErr && len(tt.expectResults) > 0 {
+			if !tt.expectErr {
 				if len(result.PodResults) != len(tt.expectResults) {
 					t.Fatalf("ScheduleWorkload() got %d results, want %d", len(result.PodResults), len(tt.expectResults))
 				}
@@ -2379,6 +2376,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				if len(result.PodResults) != len(tt.workloadPods) {
 					t.Fatalf("ScheduleWorkload() len(PodResults) = %d, want %d", len(result.PodResults), len(tt.workloadPods))
 				}
+				wantSpecNodeName := ""
+				if result.Status.IsSuccess() && !opts.DryRun {
+					wantSpecNodeName = "node1"
+				}
 				for _, pRes := range result.PodResults {
 					if !pRes.Status.IsSuccess() {
 						t.Errorf("pod %s expected success, got %v", pRes.Pod.Name, pRes.Status)
@@ -2386,8 +2387,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					if pRes.SelectedNodeName != "node1" {
 						t.Errorf("pod %s SelectedNodeName = %q, want \"node1\"", pRes.Pod.Name, pRes.SelectedNodeName)
 					}
-					if pRes.Pod.Spec.NodeName != "node1" {
-						t.Errorf("pod %s Spec.NodeName = %q, want \"node1\"", pRes.Pod.Name, pRes.Pod.Spec.NodeName)
+					if pRes.Pod.Spec.NodeName != wantSpecNodeName {
+						t.Errorf("pod %s Spec.NodeName = %q, want %q", pRes.Pod.Name, pRes.Pod.Spec.NodeName, wantSpecNodeName)
 					}
 				}
 				if filter != nil {

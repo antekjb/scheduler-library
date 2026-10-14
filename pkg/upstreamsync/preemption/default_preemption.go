@@ -19,7 +19,7 @@ import (
 	"fmt"
 
 	fwk "k8s.io/kube-scheduler/framework"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultpreemption"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 )
 
@@ -27,24 +27,28 @@ type podGroupEvaluator interface {
 	Preempt(ctx context.Context, pgInfo fwk.PodGroupInfo, podGroupSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status)
 }
 
-// DefaultPreemption is a PostFilter plugin implements the preemption logic.
-// UPSTREAM-DIFF: It is working only for PodGroupPreemption, so it has only podGroupEvaluator and Handle.
+var _ fwk.PodGroupPostFilterPlugin = &DefaultPreemption{}
+
+// DefaultPreemption wraps defaultpreemption.DefaultPreemption to override PodGroupPostFilter on 1.37.
+//
+// Migration Plan (1.38): Delete this file and use upstream defaultpreemption.DefaultPreemption directly.
 type DefaultPreemption struct {
+	*defaultpreemption.DefaultPreemption
 	podGroupEvaluator podGroupEvaluator
-	fh                fwk.Handle
+	fh                Handle
 }
 
 // NewDefaultPreemption constructs a new DefaultPreemption.
-// UPSTREAM-DIFF: Only accept PreemptionManager, no PodsListFunc.
-func NewDefaultPreemption(fh fwk.Handle, pm PreemptionManager) *DefaultPreemption {
+func NewDefaultPreemption(dp *defaultpreemption.DefaultPreemption, fh Handle) *DefaultPreemption {
 	return &DefaultPreemption{
+		DefaultPreemption: dp,
 		fh:                fh,
-		podGroupEvaluator: NewPodGroupEvaluator(fh, pm),
+		podGroupEvaluator: NewPodGroupEvaluator(fh),
 	}
 }
 
 // PodGroupPostFilter runs a default preemption for the pod group.
-func (pl *DefaultPreemption) PodGroupPostFilter(ctx context.Context, state *framework.CycleState, pgInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (postFilterResult *fwk.PodGroupPostFilterResult, status *fwk.Status) {
+func (pl *DefaultPreemption) PodGroupPostFilter(ctx context.Context, state fwk.PodGroupCycleState, pgInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (postFilterResult *fwk.PodGroupPostFilterResult, status *fwk.Status) {
 	defer func() {
 		metrics.WorkloadPreemptionAttempts.WithLabelValues(status.Code().String()).Inc()
 	}()

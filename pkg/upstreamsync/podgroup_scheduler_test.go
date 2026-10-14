@@ -228,3 +228,101 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildPodGroupSchedulingFunc(t *testing.T) {
+	ctx := context.Background()
+
+	node4CPU := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	node8CPU := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "8",
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	compositePodGroup := testutils.MakeGangCompositePodGroup("gang-cpg", "", 2)
+	leaf1 := testutils.MakeGangPodGroup("cpg-leaf1", "gang-cpg", 1)
+	leaf2 := testutils.MakeGangPodGroup("cpg-leaf2", "gang-cpg", 1)
+	pod1 := testutils.MakePod("p1", "cpg-leaf1", "3")
+	pod2 := testutils.MakePod("p2", "cpg-leaf2", "3")
+
+	tests := []struct {
+		name            string
+		nodes           []*v1.Node
+		wantSuccess     bool
+		wantAssignedSet sets.Set[string]
+	}{
+		{
+			name:            "Composite pod group succeeds and reverts reservations in snapshot",
+			nodes:           []*v1.Node{node8CPU},
+			wantSuccess:     true,
+			wantAssignedSet: sets.New("p1", "p2"),
+		},
+		{
+			name:        "Composite pod group fails when capacity is insufficient",
+			nodes:       []*v1.Node{node4CPU},
+			wantSuccess: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+				ctx,
+				t,
+				nil,
+				tt.nodes,
+				[]*schedulingv1beta1.PodGroup{leaf1, leaf2},
+				[]*schedulingv1alpha3.CompositePodGroup{compositePodGroup},
+			)
+			if err != nil {
+				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+			}
+			sched := upstreamsync.NewScheduler(snap, 0, 0, 1, nil)
+			fwkInst, err := profileMap.FrameworkForPod(&v1.Pod{})
+			if err != nil {
+				t.Fatalf("FrameworkForPod failed: %v", err)
+			}
+
+			rootInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{pod1, pod2})
+			if err != nil {
+				t.Fatalf("BuildGroupHierarchyForTest failed: %v", err)
+			}
+
+			schedFn := sched.BuildPodGroupSchedulingFunc(fwkInst, rootInfo)
+			assignments, status := schedFn(ctx)
+
+			if tt.wantSuccess {
+				if !status.IsSuccess() {
+					t.Fatalf("expected scheduling func to succeed, got %v", status)
+				}
+				if assignments == nil {
+					t.Fatalf("expected non-nil PodGroupAssignments")
+				}
+				gotPods := sets.New[string]()
+				for _, pa := range assignments.ProposedAssignments {
+					if pa.GetNodeName() != "node1" {
+						t.Errorf("expected node1 for pod %s, got %s", pa.GetPod().Name, pa.GetNodeName())
+					}
+					gotPods.Insert(pa.GetPod().Name)
+				}
+				if !gotPods.Equal(tt.wantAssignedSet) {
+					t.Errorf("got proposed pods %v, want %v", gotPods.UnsortedList(), tt.wantAssignedSet.UnsortedList())
+				}
+			} else {
+				if status.IsSuccess() {
+					t.Fatalf("expected scheduling func failure, got success")
+				}
+				if assignments != nil {
+					t.Errorf("expected nil assignments on failure, got %v", assignments)
+				}
+			}
+
+			// BuildPodGroupSchedulingFunc must always revert reservations in the snapshot.
+			ft.VerifySnapshot(t, snap, map[string]sets.Set[string]{"node1": sets.New[string]()})
+		})
+	}
+}

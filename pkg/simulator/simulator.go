@@ -67,6 +67,10 @@ type Simulator interface {
 	// If the pods do not belong to the same hierarchy, it returns an error status.
 	// The order of WorkloadSchedulingResult.PodResults is not guaranteed to match the order of input pods.
 	//
+	// When initial scheduling fails with Unschedulable and opts.CommittedVictims or opts.PotentialVictims
+	// is provided, ScheduleWorkload simulates preemption, rolls back all snapshot mutations, and returns
+	// Status: Unschedulable with the proposed PodResults and PreemptionVictims.
+	//
 	// All PodGroup and CompositePodGroup objects in the hierarchy must exist in the snapshot before calling this method.
 	// Callers can register virtual groups (groups not present in the cluster) with AddPodGroup and AddCompositePodGroup.
 	//

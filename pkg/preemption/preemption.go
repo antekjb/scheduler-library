@@ -21,16 +21,20 @@ import (
 	"context"
 	"fmt"
 
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
-// EvaluateWorkloadPreemption runs prefix search (stage 1b) and reprieval (stage 2)
-// over opts.PotentialVictims using the framework's PodGroupPostFilter plugins.
-// It returns the last successful PodGroupAssignments and the non-reprieved victims
-// on success, an Unschedulable status if all potential victims are insufficient,
-// or an Error status if victim construction or post-filter evaluation fails.
+// EvaluateWorkloadPreemption incrementally adds victims from opts.PotentialVictims
+// until the workload fits. For each victim, if opts.PreemptionFilter is set, it marks
+// the victim as preempted and skips scheduler evaluation until MayFit returns true.
+// When MayFit is true, it runs PodGroupPostFilter plugins, which remove all accumulated
+// victims, test if the workload schedules, and reprieve victims in reverse order.
+// It stops at the first fitting iteration and returns the last successful
+// PodGroupAssignments along with the victims that were not reprieved.
 func EvaluateWorkloadPreemption(
 	ctx context.Context,
 	schedFramework *upstreampreemption.PreemptionFramework,
@@ -45,7 +49,7 @@ func EvaluateWorkloadPreemption(
 
 	pm := newPrefixPreemptionManager(opts.PreemptionFilter)
 	schedFramework.SetPreemptionManager(pm)
-	defer schedFramework.SetPreemptionManager(&upstreampreemption.NoopPreemptionManager{})
+	defer schedFramework.SetPreemptionManager(&NoopPreemptionManager{})
 
 	var lastAssignments *fwk.PodGroupAssignments
 	pgSchedulingFunc := func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
@@ -77,8 +81,8 @@ func EvaluateWorkloadPreemption(
 		if postFilterStatus.IsError() {
 			return nil, nil, postFilterStatus
 		}
-		if postFilterStatus.IsSuccess() && pm.actuated {
-			return lastAssignments, pm.preemptedVictims(), fwk.NewStatus(fwk.Success)
+		if postFilterStatus.IsSuccess() {
+			return lastAssignments, pm.preemptedVictims(), nil
 		}
 	}
 
@@ -120,6 +124,8 @@ func (v *simPreemptionVictim) Pods() []fwk.PodInfo {
 	return v.pods
 }
 
+// TODO: Support PodDisruptionBudget violation counting during preemption simulation,
+// matching kube-scheduler's FilterVictimsWithPDBViolation behavior.
 func (v *simPreemptionVictim) NumPDBViolations() int {
 	return 0
 }
@@ -127,14 +133,12 @@ func (v *simPreemptionVictim) NumPDBViolations() int {
 // prefixPreemptionManager provides candidate victims and creates a ReprieveFilter
 // for prefix-search and reprieval preemption simulations.
 type prefixPreemptionManager struct {
-	upstreampreemption.NoopPreemptionManager
+	NoopPreemptionManager
 	victims          []*simPreemptionVictim
 	preemptionFilter PreemptionFilter
-	actuated         bool
 }
 
 var _ upstreampreemption.PreemptionManager = (*prefixPreemptionManager)(nil)
-var _ upstreampreemption.PreemptionExecutor = (*prefixPreemptionManager)(nil)
 
 func newPrefixPreemptionManager(filter PreemptionFilter) *prefixPreemptionManager {
 	return &prefixPreemptionManager{
@@ -146,15 +150,6 @@ func (pm *prefixPreemptionManager) addVictim(sv *simPreemptionVictim) {
 	pm.victims = append(pm.victims, sv)
 }
 
-func (pm *prefixPreemptionManager) Executor() upstreampreemption.PreemptionExecutor {
-	return pm
-}
-
-func (pm *prefixPreemptionManager) ActuatePodGroupPreemption(_ context.Context, _ upstreampreemption.PreemptionCandidate, _ fwk.PodGroupInfo, _ string) *fwk.Status {
-	pm.actuated = true
-	return nil
-}
-
 func (pm *prefixPreemptionManager) GenerateVictims(
 	_ context.Context,
 	_ fwk.PodGroupInfo,
@@ -163,7 +158,7 @@ func (pm *prefixPreemptionManager) GenerateVictims(
 	for i, sv := range pm.victims {
 		res[i] = sv
 	}
-	return res, fwk.NewStatus(fwk.Success)
+	return res, nil
 }
 
 func (pm *prefixPreemptionManager) NewReprieveFilter(
@@ -219,5 +214,63 @@ func (rf *workloadReprieveFilter) OnVictimReprieved(
 	if rf.filter != nil {
 		rf.filter.UnpreemptVictim(sv.victim)
 	}
+	return nil
+}
+
+// NoopPreemptionManager is a no-op implementation of PreemptionManager, PreemptionExecutor, and ReprieveFilter
+// used as the default simulation neutralizer when workload preemption is not active.
+type NoopPreemptionManager struct{}
+
+var _ upstreampreemption.PreemptionManager = &NoopPreemptionManager{}
+var _ upstreampreemption.PreemptionExecutor = &NoopPreemptionManager{}
+var _ upstreampreemption.ReprieveFilter = &NoopPreemptionManager{}
+
+// GenerateVictims is a no-op implementation of GenerateVictims from PreemptionManager interface.
+func (s *NoopPreemptionManager) GenerateVictims(_ context.Context, _ fwk.PodGroupInfo) ([]upstreampreemption.PreemptionVictim, *fwk.Status) {
+	return nil, nil
+}
+
+// Executor returns PreemptionExecutor from PreemptionManager interface.
+func (s *NoopPreemptionManager) Executor() upstreampreemption.PreemptionExecutor {
+	return s
+}
+
+// NewReprieveFilter is a no-op implementation of NewReprieveFilter from PreemptionManager interface.
+func (s *NoopPreemptionManager) NewReprieveFilter(_ context.Context, _ []upstreampreemption.PreemptionVictim) upstreampreemption.ReprieveFilter {
+	return s
+}
+
+// IsPodRunningPreemption is a no-op implementation of IsPodRunningPreemption from PreemptionExecutor interface.
+func (s *NoopPreemptionManager) IsPodRunningPreemption(_ types.UID) bool {
+	return false
+}
+
+// IsPodGroupRunningPreemption is a no-op implementation of IsPodGroupRunningPreemption from PreemptionExecutor interface.
+func (s *NoopPreemptionManager) IsPodGroupRunningPreemption(_ types.UID) bool {
+	return false
+}
+
+// IsPodGroupWaitingForVictims is a no-op implementation of IsPodGroupWaitingForVictims from PreemptionExecutor interface.
+func (s *NoopPreemptionManager) IsPodGroupWaitingForVictims(_ fwk.PodGroupInfo) bool {
+	return false
+}
+
+// ActuatePodPreemption is a no-op implementation of ActuatePodPreemption from PreemptionExecutor interface.
+func (s *NoopPreemptionManager) ActuatePodPreemption(_ context.Context, _ upstreampreemption.PreemptionCandidate, _ *v1.Pod, _ string) *fwk.Status {
+	return nil
+}
+
+// ActuatePodGroupPreemption is a no-op implementation of ActuatePodGroupPreemption from PreemptionExecutor interface.
+func (s *NoopPreemptionManager) ActuatePodGroupPreemption(_ context.Context, _ upstreampreemption.PreemptionCandidate, _ fwk.PodGroupInfo, _ string) *fwk.Status {
+	return nil
+}
+
+// ShouldAttemptReprieval is a no-op implementation of ShouldAttemptReprieval from ReprieveFilter interface.
+func (s *NoopPreemptionManager) ShouldAttemptReprieval(_ context.Context, _ upstreampreemption.PreemptionVictim) (bool, error) {
+	return false, nil
+}
+
+// OnVictimReprieved is a no-op implementation of OnVictimReprieved from ReprieveFilter interface.
+func (s *NoopPreemptionManager) OnVictimReprieved(_ context.Context, _ upstreampreemption.PreemptionVictim) error {
 	return nil
 }

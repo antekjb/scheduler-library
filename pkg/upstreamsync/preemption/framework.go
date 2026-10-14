@@ -56,9 +56,6 @@ type PreemptionFramework struct {
 
 // NewPreemptionFramework creates a new PreemptionFramework.
 func NewPreemptionFramework(fw framework.Framework, preemptionManager PreemptionManager) *PreemptionFramework {
-	if preemptionManager == nil {
-		preemptionManager = &NoopPreemptionManager{}
-	}
 	return &PreemptionFramework{
 		Framework: fw,
 		pm:        preemptionManager,
@@ -69,16 +66,10 @@ func NewPreemptionFramework(fw framework.Framework, preemptionManager Preemption
 // PreemptionManager can be changed dynamically during scheduling cycles by usage of SetPreemptionManager(), so all plugins should
 // use this method to get the current PreemptionManager.
 func (f *PreemptionFramework) PreemptionManager() PreemptionManager {
-	if f.pm == nil {
-		return &NoopPreemptionManager{}
-	}
 	return f.pm
 }
 
 // SetPreemptionManager sets the PreemptionManager on the framework.
 func (f *PreemptionFramework) SetPreemptionManager(pm PreemptionManager) {
-	if pm == nil {
-		pm = &NoopPreemptionManager{}
-	}
 	f.pm = pm
 }

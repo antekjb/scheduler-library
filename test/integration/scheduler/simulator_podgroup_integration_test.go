@@ -518,7 +518,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 		wantProbeFits   bool
 	}{
 		{
-			name:         "(a) fits without preemption",
+			name:         "fits without preemption",
 			nodes:        []*v1.Node{node8CPU},
 			existingPods: []*v1.Pod{v1Pod, v2Pod},
 			workloadPods: []*v1.Pod{
@@ -541,7 +541,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			wantProbeFits:   false,
 		},
 		{
-			name:         "(b) fits after preempting subset of PotentialVictims with reprieve",
+			name:         "fits after preempting subset of PotentialVictims with reprieve",
 			nodes:        []*v1.Node{node6CPU},
 			existingPods: []*v1.Pod{vSmallPod, vMedPod, vHighPod},
 			workloadPods: []*v1.Pod{
@@ -565,7 +565,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			wantProbeFits:   true,
 		},
 		{
-			name:         "(c) multi-pod PreemptionVictim preempted and restored atomically",
+			name:         "multi-pod PreemptionVictim preempted and restored atomically",
 			nodes:        []*v1.Node{node6CPU},
 			existingPods: []*v1.Pod{vMulti1, vMulti2, vSingle},
 			workloadPods: []*v1.Pod{
@@ -588,7 +588,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			wantProbeFits:   false,
 		},
 		{
-			name:         "(d) CommittedVictims removed upfront and included in PreemptionVictims",
+			name:         "CommittedVictims removed upfront and included in PreemptionVictims",
 			nodes:        []*v1.Node{node8CPU},
 			existingPods: []*v1.Pod{vCommittedPod, v1Pod, v2Pod},
 			workloadPods: []*v1.Pod{
@@ -614,7 +614,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			wantProbeFits:   true,
 		},
 		{
-			name:         "(e) fails when all PotentialVictims are insufficient and reverts snapshot",
+			name:         "fails when all PotentialVictims are insufficient and reverts snapshot",
 			nodes:        []*v1.Node{node6CPU},
 			existingPods: []*v1.Pod{v1Pod, v2Pod},
 			workloadPods: []*v1.Pod{
@@ -637,7 +637,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			wantProbeFits:   true,
 		},
 		{
-			name:         "(f) DryRun with preemption returns victims and reverts snapshot",
+			name:         "DryRun with preemption returns victims and reverts snapshot",
 			nodes:        []*v1.Node{node6CPU},
 			existingPods: []*v1.Pod{vSmallPod, vMedPod, vHighPod},
 			workloadPods: []*v1.Pod{

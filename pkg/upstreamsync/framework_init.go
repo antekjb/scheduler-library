@@ -294,11 +294,14 @@ func buildExtenders(logger klog.Logger, extenders []schedulerapi.Extender, profi
 // ProfileMap embeds profile.Map to attach FrameworkForPod and FrameworkForPodGroup.
 type ProfileMap struct {
 	profile.Map
-	// UPSTREAM-DIFF: stores one PreemptionFramework wrapper per profile so that both
-	// FrameworkForPodGroup and plugin handles share the same PreemptionFramework instance.
-	// Migration Plan (1.38): Remove preemptionFrameworks once framework.Framework in 1.38
+	// PreemptionFrameworks stores one PreemptionFramework wrapper per profile so that
+	// FrameworkForPodGroup, ApplySimulationNeutralizers, and plugin handles share the same
+	// PreemptionFramework instance.
+	//
+	// UPSTREAM-DIFF: Temporary 1.37 wrapper map.
+	// Migration Plan (1.38): Remove PreemptionFrameworks once framework.Framework in 1.38
 	// implements PreemptionManager() and SetPreemptionManager() directly.
-	preemptionFrameworks map[string]*preemption.PreemptionFramework
+	PreemptionFrameworks map[string]*preemption.PreemptionFramework
 }
 
 func getProfileName(pod *v1.Pod) string {
@@ -335,7 +338,7 @@ func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) 
 		return nil, fmt.Errorf("no pods in pod group")
 	}
 	name := getProfileName(pods[0])
-	f, ok := p.preemptionFrameworks[name]
+	f, ok := p.PreemptionFrameworks[name]
 	if !ok {
 		return nil, fmt.Errorf("profile not found for scheduler name %q", name)
 	}
@@ -359,7 +362,7 @@ func wrapRegistryForPreemption(registry frameworkruntime.Registry, numProfiles i
 		registry[name] = func(ctx context.Context, args runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
 			pf, ok := preemptionFrameworks[fh.ProfileName()]
 			if !ok {
-				pf = preemption.NewPreemptionFramework(fh.(framework.Framework), &preemption.NoopPreemptionManager{})
+				pf = preemption.NewPreemptionFramework(fh.(framework.Framework), nil)
 				preemptionFrameworks[fh.ProfileName()] = pf
 			}
 			pl, err := origFactory(ctx, args, pf)
@@ -453,7 +456,7 @@ func NewFrameworkMap(
 
 	return &ProfileMap{
 		Map:                  profiles,
-		preemptionFrameworks: preemptionFrameworks,
+		PreemptionFrameworks: preemptionFrameworks,
 	}, nil
 }
 

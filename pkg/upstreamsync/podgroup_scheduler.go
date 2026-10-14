@@ -152,7 +152,7 @@ func (sched *Scheduler) BuildPodGroupSchedulingFunc(
 			return nil, rootResult.Status
 		}
 		var proposedAssignments []fwk.ProposedAssignment
-		for res := range successfulLeafResults(podGroupInfo, results) {
+		for res := range SuccessfulLeafResults(podGroupInfo, results) {
 			proposedAssignments = append(proposedAssignments, makeProposedAssignments(res)...)
 		}
 		return &fwk.PodGroupAssignments{
@@ -587,7 +587,7 @@ func (sched *Scheduler) assumeSubtreeWithRevert(
 		}
 	}()
 
-	for leafResult := range successfulLeafResults(pgi, results) {
+	for leafResult := range SuccessfulLeafResults(pgi, results) {
 		for _, podResult := range leafResult.PodResults {
 			if !podResult.status.IsSuccess() || podResult.GetNodeName() == "" {
 				continue
@@ -605,12 +605,12 @@ func (sched *Scheduler) assumeSubtreeWithRevert(
 	return revertFns, nil
 }
 
-// successfulLeafResults walks the tree down to the successful leafs.
+// SuccessfulLeafResults walks the tree down to the successful leafs.
 // A leaf is only deemed successful if its ancestors are also successful.
 // If the results are missing for a given subtree, that subtree is skipped.
 //
-// UPSTREAM-DIFF: none, copied verbatim.
-func successfulLeafResults(root *framework.PodGroupInfo, results map[fwk.EntityKey]*PodGroupAlgorithmResult) iter.Seq[*PodGroupAlgorithmResult] {
+// UPSTREAM-DIFF: exported for use by pkg/upstreamsync/snapshot.
+func SuccessfulLeafResults(root *framework.PodGroupInfo, results map[fwk.EntityKey]*PodGroupAlgorithmResult) iter.Seq[*PodGroupAlgorithmResult] {
 	return func(yield func(*PodGroupAlgorithmResult) bool) {
 		var walk func(pgi *framework.PodGroupInfo) bool
 		walk = func(pgi *framework.PodGroupInfo) bool {
@@ -745,7 +745,7 @@ func makeCompositePodGroupAssignments(
 	placementStates := make([]fwk.PlacementCycleState, 0, len(successfulResults))
 	for placement, subtreeResults := range successfulResults {
 		var combinedProposedAssignments []fwk.ProposedAssignment
-		for result := range successfulLeafResults(pgi, subtreeResults) {
+		for result := range SuccessfulLeafResults(pgi, subtreeResults) {
 			combinedProposedAssignments = append(combinedProposedAssignments, makeProposedAssignments(result)...)
 		}
 		placementPodGroupAssignments = append(placementPodGroupAssignments, &fwk.PodGroupAssignments{

@@ -13,8 +13,8 @@
 # limitations under the License.
 
 GO_CMD ?= go
-GOLANGCI_LINT := $(GO_CMD) tool golangci-lint
-SETUP_ENVTEST := $(GO_CMD) tool setup-envtest
+GOLANGCI_LINT := $(GO_CMD) tool -modfile=hack/tools/go.mod golangci-lint
+SETUP_ENVTEST := $(GO_CMD) tool -modfile=hack/tools/go.mod setup-envtest
 
 .PHONY: all
 all: build test lint
@@ -46,4 +46,5 @@ verify: verify-modules lint test
 .PHONY: verify-modules
 verify-modules:
 	$(GO_CMD) mod tidy
-	git --no-pager diff --exit-code go.mod go.sum
+	$(GO_CMD) -C hack/tools mod tidy
+	git --no-pager diff --exit-code go.mod go.sum hack/tools/go.mod hack/tools/go.sum

@@ -531,7 +531,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 						&integrationVictim{name: "v1", pods: []*v1.Pod{v1Pod}},
 						&integrationVictim{name: "v2", pods: []*v1.Pod{v2Pod}},
 					}),
-					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 2},
+					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 0},
 				},
 			},
 			wantStatusCode:  fwk.Success,
@@ -539,6 +539,30 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			wantVictimNames: nil,
 			probePodCPU:     "1",
 			wantProbeFits:   false,
+		},
+		{
+			name:         "preemption triggered by PreemptionFilter when node has free capacity",
+			nodes:        []*v1.Node{node8CPU},
+			existingPods: []*v1.Pod{vSmallPod, vMedPod, vHighPod},
+			workloadPods: []*v1.Pod{
+				makePod(ns, "w-free1", "preempt-gang", "1"),
+				makePod(ns, "w-free2", "preempt-gang", "1"),
+			},
+			opts: snapshot.ScheduleWorkloadOptions{
+				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+						&integrationVictim{name: "vSmall", pods: []*v1.Pod{vSmallPod}},
+						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
+						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},
+					}),
+					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 3},
+				},
+			},
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
+			wantVictimNames: []string{"vMed"},
+			probePodCPU:     "3",
+			wantProbeFits:   true,
 		},
 		{
 			name:         "fits after preempting subset of PotentialVictims with reprieve",

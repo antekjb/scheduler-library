@@ -79,9 +79,9 @@ type WorkloadPreemptionOptions struct {
 	// If nil or empty, no victims are preempted upfront.
 	CommittedVictims []PreemptionVictim
 
-	// PreemptionFilter is an optional fast pre-check used during both prefix search and
-	// reprieval to skip scheduling evaluations when the current victim set is known
-	// to be insufficient.
+	// PreemptionFilter is an optional fast pre-check used before the initial scheduling
+	// attempt and during both prefix search and reprieval to skip scheduling evaluations
+	// when the current victim set is known to be insufficient.
 	// If nil, no pre-check filter is applied.
 	PreemptionFilter PreemptionFilter
 }

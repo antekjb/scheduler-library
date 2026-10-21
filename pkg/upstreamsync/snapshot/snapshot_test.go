@@ -2087,7 +2087,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
 				vic1 := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod2CPU}}
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
-				f := newCPUPreemptionFilter(2)
+				f := newCPUPreemptionFilter(0)
 				return ScheduleWorkloadOptions{
 					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
 						PotentialVictims: slices.Values([]PreemptionVictim{vic1, vic2}),
@@ -2100,6 +2100,33 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 			wantVictimNames: nil,
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v1-pod", "v2-pod", "w-pod1", "w-pod2"),
+			},
+		},
+		{
+			name:         "PreemptionFilter with MayFit false initially triggers preemption and reprieval even when node capacity is free",
+			nodes:        []*v1.Node{node8CPU},
+			existingPods: []*v1.Pod{vSmallPod, vMedPod, vHighPod},
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "1"),
+				testutils.MakePod("w-pod2", "gang-pg", "1"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vSmall := &testVictim{name: "vSmall", pods: []*v1.Pod{vSmallPod}}
+				vMed := &testVictim{name: "vMed", pods: []*v1.Pod{vMedPod}}
+				vHigh := &testVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}}
+				f := newCPUPreemptionFilter(3)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]PreemptionVictim{vSmall, vMed, vHigh}),
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
+			wantVictimNames: []string{"vMed"},
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("v-small-pod", "v-med-pod", "v-high-pod"),
 			},
 		},
 		{

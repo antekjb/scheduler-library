@@ -1242,9 +1242,15 @@ func TestScheduleWorkload(t *testing.T) {
 
 	heavyPod1 := testutils.MakePod("hp1", "gang-pg", "3")
 	heavyPod2 := testutils.MakePod("hp2", "gang-pg", "3")
+	heavyPod3 := testutils.MakePod("hp3", "gang-pg", "1")
+
+	leafPG3 := testutils.MakeGangPodGroup("leaf-3", "root-cpg", 1)
 
 	leafPod1 := testutils.MakePod("lp1", "leaf-1", "2")
 	leafPod2 := testutils.MakePod("lp2", "leaf-2", "2")
+	heavyLeafPod1 := testutils.MakePod("hlp1", "leaf-1", "3")
+	heavyLeafPod2 := testutils.MakePod("hlp2", "leaf-2", "3")
+	heavyLeafPod3 := testutils.MakePod("hlp3", "leaf-3", "3")
 
 	disjointPod := testutils.MakePod("dp", "disjoint-pg", "1")
 	noPGPod := testutils.MakePod("no-pg", "", "")
@@ -1301,13 +1307,31 @@ func TestScheduleWorkload(t *testing.T) {
 			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 		},
 		{
-			name:                "Failure - gang unschedulable rolls back snapshot reservations",
-			nodes:               []*v1.Node{node4CPU},
-			podGroups:           []*schedulingv1beta1.PodGroup{gangPG},
-			compositePodGroups:  nil,
-			pods:                []*v1.Pod{heavyPod1, heavyPod2},
-			opts:                NewScheduleWorkloadOptions(false),
-			expectResults:       nil,
+			name:               "Failure - gang unschedulable rolls back snapshot reservations",
+			nodes:              []*v1.Node{node4CPU},
+			podGroups:          []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups: nil,
+			pods:               []*v1.Pod{heavyPod1, heavyPod2, heavyPod3},
+			opts:               NewScheduleWorkloadOptions(false),
+			expectResults: []SchedulingResult{
+				{Pod: heavyPod1, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available")},
+				{Pod: heavyPod2, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 nodes are available: 1 Insufficient cpu.")},
+				{Pod: heavyPod3, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available")},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
+		},
+		{
+			name:               "Failure - composite pod group unschedulable rolls back snapshot reservations",
+			nodes:              []*v1.Node{node4CPU},
+			podGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2, leafPG3},
+			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG},
+			pods:               []*v1.Pod{heavyLeafPod1, heavyLeafPod2, heavyLeafPod3},
+			opts:               NewScheduleWorkloadOptions(false),
+			expectResults: []SchedulingResult{
+				{Pod: heavyLeafPod1, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, `ancestor composite pod group "root-cpg" is unschedulable`)},
+				{Pod: heavyLeafPod2, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 nodes are available: 1 Insufficient cpu.")},
+				{Pod: heavyLeafPod3, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, `ancestor composite pod group "root-cpg" is unschedulable`)},
+			},
 			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 		},
 		{
@@ -1383,7 +1407,11 @@ func TestScheduleWorkload(t *testing.T) {
 				t.Fatalf("ScheduleWorkload() error = %v, expectErr %v", result.Status.AsError(), tt.expectErr)
 			}
 
-			if !tt.expectErr {
+			if tt.expectErr {
+				if len(result.PodResults) != 0 {
+					t.Errorf("expected empty PodResults on error, got %v", result.PodResults)
+				}
+			} else {
 				if len(result.PodResults) != len(tt.expectResults) {
 					t.Fatalf("ScheduleWorkload() got %d results, want %d", len(result.PodResults), len(tt.expectResults))
 				}
@@ -1391,8 +1419,11 @@ func TestScheduleWorkload(t *testing.T) {
 					if result.PodResults[i].SelectedNodeName != tt.expectResults[i].SelectedNodeName {
 						t.Errorf("result[%d] SelectedNodeName = %q, want %q", i, result.PodResults[i].SelectedNodeName, tt.expectResults[i].SelectedNodeName)
 					}
-					if result.PodResults[i].Status.IsSuccess() != tt.expectResults[i].Status.IsSuccess() {
-						t.Errorf("result[%d] Status.IsSuccess = %v, want %v", i, result.PodResults[i].Status.IsSuccess(), tt.expectResults[i].Status.IsSuccess())
+					if result.PodResults[i].Status.Code() != tt.expectResults[i].Status.Code() {
+						t.Errorf("result[%d] Status.Code() = %v, want %v", i, result.PodResults[i].Status.Code(), tt.expectResults[i].Status.Code())
+					}
+					if wantMsg := tt.expectResults[i].Status.Message(); wantMsg != "" && result.PodResults[i].Status.Message() != wantMsg {
+						t.Errorf("result[%d] Status.Message() = %q, want %q", i, result.PodResults[i].Status.Message(), wantMsg)
 					}
 					wantSpecNodeName := tt.expectResults[i].SelectedNodeName
 					if tt.opts.DryRun {
@@ -2076,6 +2107,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 		wantVictimNames     []string
 		expectSnapshotState map[string]sets.Set[string]
 		wantError           bool
+		wantEmptyPodResults bool
 	}{
 		{
 			name:         "Workload fits without preemption when sufficient capacity is free",
@@ -2346,9 +2378,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   false,
-			wantVictimNames: nil,
+			wantStatusCode:      fwk.Unschedulable,
+			wantScheduled:       false,
+			wantVictimNames:     nil,
+			wantEmptyPodResults: true,
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-committed", "v1-pod", "v2-pod"),
 			},
@@ -2491,8 +2524,28 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 						t.Errorf("filter activeVictims count = %d, want %d", len(filter.activeVictims), len(result.PreemptionVictims))
 					}
 				}
-			} else if len(result.PodResults) != 0 {
-				t.Errorf("expected empty PodResults on failure, got %v", result.PodResults)
+			} else if tt.wantError || tt.wantEmptyPodResults {
+				if len(result.PodResults) != 0 {
+					t.Errorf("expected empty PodResults, got %v", result.PodResults)
+				}
+			} else {
+				if len(result.PodResults) == 0 {
+					t.Fatalf("expected non-empty PodResults on unschedulable workload")
+				}
+				for _, pRes := range result.PodResults {
+					if pRes.Status.IsSuccess() {
+						t.Errorf("pod %s expected failure status, got %v", pRes.Pod.Name, pRes.Status)
+					}
+					if pRes.Status.Message() == "" {
+						t.Errorf("pod %s expected non-empty status message", pRes.Pod.Name)
+					}
+					if pRes.SelectedNodeName != "" {
+						t.Errorf("pod %s expected empty SelectedNodeName on failure, got %q", pRes.Pod.Name, pRes.SelectedNodeName)
+					}
+					if pRes.Pod.Spec.NodeName != "" {
+						t.Errorf("pod %s expected empty Spec.NodeName on failure, got %q", pRes.Pod.Name, pRes.Pod.Spec.NodeName)
+					}
+				}
 			}
 
 			ft.VerifySnapshot(t, snap, tt.expectSnapshotState)

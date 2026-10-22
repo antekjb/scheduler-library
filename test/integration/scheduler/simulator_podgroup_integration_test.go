@@ -589,6 +589,29 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			wantProbeFits:   true,
 		},
 		{
+			name:         "fits after initial node-fit failure without PreemptionFilter",
+			nodes:        []*v1.Node{node6CPU},
+			existingPods: []*v1.Pod{vSmallPod, vMedPod, vHighPod},
+			workloadPods: []*v1.Pod{
+				makePod(ns, "w-nofilter1", "preempt-gang", "2"),
+				makePod(ns, "w-nofilter2", "preempt-gang", "2"),
+			},
+			opts: snapshot.ScheduleWorkloadOptions{
+				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+						&integrationVictim{name: "vSmall", pods: []*v1.Pod{vSmallPod}},
+						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
+						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},
+					}),
+				},
+			},
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
+			wantVictimNames: []string{"vMed"},
+			probePodCPU:     "1",
+			wantProbeFits:   true,
+		},
+		{
 			name:         "multi-pod PreemptionVictim preempted and restored atomically",
 			nodes:        []*v1.Node{node6CPU},
 			existingPods: []*v1.Pod{vMulti1, vMulti2, vSingle},

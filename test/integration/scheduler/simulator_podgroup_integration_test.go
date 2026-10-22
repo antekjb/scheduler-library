@@ -432,15 +432,15 @@ func (v *integrationVictim) Pods() []*v1.Pod {
 }
 
 type integrationCPUPreemptionFilter struct {
-	minRequiredCPU int64
-	preemptedCPU   int64
+	availableCPU int64
+	requiredCPU  int64
 }
 
 func (f *integrationCPUPreemptionFilter) PreemptVictim(v snapshot.PreemptionVictim) {
 	for _, p := range v.Pods() {
 		for _, c := range p.Spec.Containers {
 			cpu := c.Resources.Requests[v1.ResourceCPU]
-			f.preemptedCPU += cpu.Value()
+			f.availableCPU += cpu.Value()
 		}
 	}
 }
@@ -449,13 +449,13 @@ func (f *integrationCPUPreemptionFilter) UnpreemptVictim(v snapshot.PreemptionVi
 	for _, p := range v.Pods() {
 		for _, c := range p.Spec.Containers {
 			cpu := c.Resources.Requests[v1.ResourceCPU]
-			f.preemptedCPU -= cpu.Value()
+			f.availableCPU -= cpu.Value()
 		}
 	}
 }
 
 func (f *integrationCPUPreemptionFilter) MayFit() bool {
-	return f.preemptedCPU >= f.minRequiredCPU
+	return f.availableCPU >= f.requiredCPU
 }
 
 func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
@@ -531,7 +531,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 						&integrationVictim{name: "v1", pods: []*v1.Pod{v1Pod}},
 						&integrationVictim{name: "v2", pods: []*v1.Pod{v2Pod}},
 					}),
-					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 0},
+					PreemptionFilter: &integrationCPUPreemptionFilter{availableCPU: 4, requiredCPU: 4},
 				},
 			},
 			wantStatusCode:  fwk.Success,
@@ -555,7 +555,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
 						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},
 					}),
-					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 3},
+					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 3},
 				},
 			},
 			wantStatusCode:  fwk.Unschedulable,
@@ -579,7 +579,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
 						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},
 					}),
-					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 3},
+					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 3},
 				},
 			},
 			wantStatusCode:  fwk.Unschedulable,
@@ -602,7 +602,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 						&integrationVictim{name: "vMulti", pods: []*v1.Pod{vMulti1, vMulti2}},
 						&integrationVictim{name: "vSingle", pods: []*v1.Pod{vSingle}},
 					}),
-					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 4},
+					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 4},
 				},
 			},
 			wantStatusCode:  fwk.Unschedulable,
@@ -628,7 +628,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 						&integrationVictim{name: "v1", pods: []*v1.Pod{v1Pod}},
 						&integrationVictim{name: "v2", pods: []*v1.Pod{v2Pod}},
 					}),
-					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 2},
+					PreemptionFilter: &integrationCPUPreemptionFilter{availableCPU: 4, requiredCPU: 6},
 				},
 			},
 			wantStatusCode:  fwk.Unschedulable,
@@ -651,7 +651,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 						&integrationVictim{name: "v1", pods: []*v1.Pod{v1Pod}},
 						&integrationVictim{name: "v2", pods: []*v1.Pod{v2Pod}},
 					}),
-					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 2},
+					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 2},
 				},
 			},
 			wantStatusCode:  fwk.Unschedulable,
@@ -676,7 +676,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
 						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},
 					}),
-					PreemptionFilter: &integrationCPUPreemptionFilter{minRequiredCPU: 3},
+					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 3},
 				},
 			},
 			wantStatusCode:  fwk.Unschedulable,
